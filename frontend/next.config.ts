@@ -1,7 +1,12 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  output: 'export',
+  // Use the repository name as the base path for GitHub Pages
+  basePath: '/NeuroVault',
+  images: {
+    unoptimized: true,
+  },
 };
 
 export default nextConfig;

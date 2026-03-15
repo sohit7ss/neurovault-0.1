@@ -130,7 +130,7 @@ export default function RoadmapPage() {
       <AnimatePresence>
         {showForm && (
           <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} style={{ overflow: 'hidden' }}>
-            <div className="glass-card card-3d" style={{ padding: 24, marginBottom: 24 }}>
+            <div className="glass-card" style={{ padding: 24, marginBottom: 24, position: 'relative', zIndex: 5 }}>
               <h3 style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 16 }}>Generate Dynamic Roadmap</h3>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16, marginBottom: 20 }}>
                 <div>
@@ -171,7 +171,14 @@ export default function RoadmapPage() {
                 </div>
 
                 <button onClick={handleGenerate} disabled={generating || !goal.trim()} className="btn-gradient"
-                  style={{ padding: '12px 28px', opacity: generating || !goal.trim() ? 0.6 : 1, whiteSpace: 'nowrap' }}>
+                  style={{ 
+                    padding: '12px 28px', 
+                    opacity: generating || !goal.trim() ? 0.6 : 1, 
+                    whiteSpace: 'nowrap',
+                    cursor: generating || !goal.trim() ? 'not-allowed' : 'pointer',
+                    position: 'relative',
+                    zIndex: 10
+                  }}>
                   {generating ? 'Generating Syllabus...' : '🚀 Create Journey'}
                 </button>
               </div>
@@ -312,7 +319,7 @@ export default function RoadmapPage() {
                           }}>{pi + 1}</div>
                           <div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 4 }}>
-                              <h3 style={{ fontSize: '1.15rem', fontWeight: 600, m: 0 }}>{phase.title}</h3>
+                              <h3 style={{ fontSize: '1.15rem', fontWeight: 600, margin: 0 }}>{phase.title}</h3>
                               <span style={{ fontSize: '0.7rem', padding: '2px 8px', borderRadius: 10, background: 'rgba(255,255,255,0.05)', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5 }}>{status}</span>
                             </div>
                             <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginBottom: 8, lineHeight: 1.4 }}>{phase.description}</p>
@@ -333,7 +340,13 @@ export default function RoadmapPage() {
                         {isExpanded && (
                           <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} style={{ overflow: 'hidden' }}>
                             <div style={{ padding: '0 24px 24px', display: 'flex', flexDirection: 'column', gap: 12, borderTop: '1px solid var(--border-subtle)', paddingTop: 20 }}>
-                              {phase.topics?.map((topic, ti) => (
+                              {/* Phase prerequisites */}
+                              {(phase as any).prerequisites && (
+                                <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: 8, padding: '8px 12px', marginBottom: 4 }}>
+                                  <strong style={{ color: '#f59e0b' }}>Prerequisites:</strong> {(phase as any).prerequisites}
+                                </div>
+                              )}
+                              {phase.topics?.map((topic: any, ti: number) => (
                                 <div key={ti} style={{
                                   borderRadius: 12,
                                   background: topic.completed ? `${color}08` : 'rgba(255,255,255,0.02)',
@@ -348,22 +361,55 @@ export default function RoadmapPage() {
                                       color: 'inherit', fontFamily: 'inherit', textAlign: 'left', width: '100%',
                                     }}>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                                      <HiOutlineCheckCircle size={22} style={{ color: topic.completed ? color : 'var(--text-muted)', transition: 'color 0.2s' }} />
-                                      <span style={{ fontSize: '0.95rem', fontWeight: 500, textDecoration: topic.completed ? 'line-through' : 'none', color: topic.completed ? 'var(--text-muted)' : 'var(--text-primary)' }}>
-                                        {topic.title}
-                                      </span>
+                                      <HiOutlineCheckCircle size={22} style={{ color: topic.completed ? color : 'var(--text-muted)', transition: 'color 0.2s', flexShrink: 0 }} />
+                                      <div>
+                                        <span style={{ fontSize: '0.95rem', fontWeight: 500, textDecoration: topic.completed ? 'line-through' : 'none', color: topic.completed ? 'var(--text-muted)' : 'var(--text-primary)' }}>
+                                          {topic.title}
+                                        </span>
+                                        {topic.description && (
+                                          <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.4 }}>
+                                            {topic.description}
+                                          </div>
+                                        )}
+                                      </div>
                                     </div>
-                                    {topic.estimated_hours && (
-                                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', background: 'rgba(0,0,0,0.2)', padding: '2px 8px', borderRadius: 4 }}>
-                                        {topic.estimated_hours}h
-                                      </span>
-                                    )}
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                                      {topic.difficulty && (
+                                        <span style={{
+                                          fontSize: '0.7rem', padding: '2px 8px', borderRadius: 4, fontWeight: 600, textTransform: 'uppercase',
+                                          background: topic.difficulty === 'easy' ? 'rgba(16,185,129,0.12)' : topic.difficulty === 'medium' ? 'rgba(245,158,11,0.12)' : 'rgba(239,68,68,0.12)',
+                                          color: topic.difficulty === 'easy' ? '#10b981' : topic.difficulty === 'medium' ? '#f59e0b' : '#ef4444',
+                                        }}>
+                                          {topic.difficulty}
+                                        </span>
+                                      )}
+                                      {topic.estimated_hours && (
+                                        <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', background: 'rgba(0,0,0,0.2)', padding: '2px 8px', borderRadius: 4 }}>
+                                          {topic.estimated_hours}h
+                                        </span>
+                                      )}
+                                    </div>
                                   </button>
+
+                                  {/* Subtopics */}
+                                  {topic.subtopics && topic.subtopics.length > 0 && (
+                                    <div style={{ padding: '0 16px 10px 48px', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                                      {topic.subtopics.map((sub: string, si: number) => (
+                                        <span key={si} style={{
+                                          fontSize: '0.72rem', padding: '3px 10px', borderRadius: 20,
+                                          background: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-subtle)',
+                                          color: 'var(--text-secondary)',
+                                        }}>
+                                          {sub}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
 
                                   {/* Resources Panel */}
                                   {topic.resources && topic.resources.length > 0 && (
                                     <div style={{ padding: '0 16px 12px 48px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-                                      {topic.resources.map((res, ri) => (
+                                      {topic.resources.map((res: any, ri: number) => (
                                         <a key={ri} href={res.url || '#'} target="_blank" rel="noopener noreferrer"
                                           style={{
                                             display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.8rem',
@@ -374,7 +420,11 @@ export default function RoadmapPage() {
                                           onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.03)'}
                                         >
                                           <span style={{ color: color }}>{getResourceIcon(res.type)}</span>
-                                          <span>{res.title} <span style={{ opacity: 0.5 }}>({res.type})</span></span>
+                                          <span style={{ flex: 1 }}>{res.title}</span>
+                                          <span style={{ fontSize: '0.7rem', opacity: 0.5, textTransform: 'capitalize' }}>{res.type}</span>
+                                          {res.url && res.url !== '#' && (
+                                            <HiOutlineLink size={12} style={{ opacity: 0.4 }} />
+                                          )}
                                         </a>
                                       ))}
                                     </div>

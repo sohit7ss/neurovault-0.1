@@ -2,10 +2,10 @@
 import os
 import hashlib
 from werkzeug.utils import secure_filename
-from models import db, Document
 from error_handler import NotFoundError, ForbiddenError, ValidationError
 from security import validate_file, sanitize_string, compute_file_hash
 from flask import current_app
+from supabase_client import sb_select, sb_insert, sb_delete, sb_update
 
 
 def upload_document(user_id, file, title=None):
@@ -21,8 +21,8 @@ def upload_document(user_id, file, title=None):
     file_hash = compute_file_hash(file_data)
     
     # Check for duplicate
-    existing = Document.query.filter_by(user_id=user_id, file_hash=file_hash).first()
-    if existing:
+    existing = sb_select('documents', eq=('file_hash', file_hash), single=True)
+    if existing and existing.get('user_id') == user_id:
         raise ValidationError("This document has already been uploaded")
     
     # Create user directory
@@ -45,22 +45,32 @@ def upload_document(user_id, file, title=None):
     else:
         title = sanitize_string(title, 500)
     
-    # Save to database
-    document = Document(
-        user_id=user_id,
-        title=title,
-        filename=filename,
-        file_path=file_path,
-        file_hash=file_hash,
-        content_text=content_text,
-        file_size=size,
-        mime_type=mime,
-        status='ready' if content_text else 'processing',
-    )
-    db.session.add(document)
-    db.session.commit()
+    # Save to Supabase
+    doc_data = {
+        'user_id': user_id,
+        'title': title,
+        'filename': filename,
+        'file_path': file_path,
+        'file_hash': file_hash,
+        'content_text': content_text,
+        'file_size': size,
+        'mime_type': mime,
+        'status': 'ready' if content_text else 'processing',
+    }
+    res = sb_insert('documents', doc_data)
     
-    return document.to_dict()
+    document = res.data[0] if res.data else None
+    if not document:
+        raise ValidationError("Failed to save document record")
+    
+    # Check achievements
+    try:
+        from services.achievement_service import check_and_award_achievements
+        check_and_award_achievements(user_id, 'document_upload')
+    except Exception:
+        pass
+        
+    return document
 
 
 def extract_text(file_data: bytes, extension: str) -> str:
@@ -110,53 +120,68 @@ def _extract_docx(file_data: bytes) -> str:
 
 
 def get_user_documents(user_id, page=1, per_page=20):
-    """Get paginated documents for a user."""
-    pagination = Document.query.filter_by(user_id=user_id) \
-        .order_by(Document.created_at.desc()) \
-        .paginate(page=page, per_page=per_page, error_out=False)
+    """List documents for a user with pagination."""
+    # Supabase simple pagination using range
+    from supabase_client import get_supabase
+    start = (page - 1) * per_page
+    end = start + per_page - 1
+    
+    res = get_supabase().table('documents') \
+        .select("*", count="exact") \
+        .eq('user_id', user_id) \
+        .order('created_at', desc=True) \
+        .range(start, end) \
+        .execute()
+    
+    total = res.count if res.count is not None else 0
+    pages = (total + per_page - 1) // per_page
     
     return {
-        'documents': [d.to_dict() for d in pagination.items],
-        'total': pagination.total,
+        'documents': res.data,
+        'total': total,
         'page': page,
-        'pages': pagination.pages,
+        'pages': pages,
     }
 
 
 def get_document(user_id, document_id):
     """Get a single document with ownership check."""
-    document = Document.query.get(document_id)
+    document = sb_select('documents', eq=('id', document_id), single=True)
     if not document:
         raise NotFoundError("Document not found")
-    if document.user_id != user_id:
+    if document.get('user_id') != user_id:
         raise ForbiddenError("Access denied")
-    return document.to_dict()
+    return document
+
 
 
 def delete_document(user_id, document_id):
     """Delete a document with ownership check."""
-    document = Document.query.get(document_id)
+    document = sb_select('documents', eq=('id', document_id), single=True)
     if not document:
         raise NotFoundError("Document not found")
-    if document.user_id != user_id:
+    if document.get('user_id') != user_id:
         raise ForbiddenError("Access denied")
     
     # Delete file from disk
-    if os.path.exists(document.file_path):
-        os.remove(document.file_path)
+    file_path = document.get('file_path')
+    if file_path and os.path.exists(file_path):
+        os.remove(file_path)
     
-    # Delete from database (cascade deletes embeddings)
-    db.session.delete(document)
-    db.session.commit()
+    # Delete from Supabase
+    sb_delete('documents', match={'id': document_id})
+    # Also delete embeddings for this document
+    sb_delete('embeddings', match={'document_id': document_id})
     
     return {'message': 'Document deleted successfully'}
 
 
 def get_document_content(user_id, document_id):
-    """Get document text content for AI processing."""
-    document = Document.query.get(document_id)
+    """Get full text content of a document."""
+    document = sb_select('documents', eq=('id', document_id), single=True)
     if not document:
         raise NotFoundError("Document not found")
-    if document.user_id != user_id:
+    if document.get('user_id') != user_id:
         raise ForbiddenError("Access denied")
-    return document.content_text or ''
+    return document.get('content_text', '')
+

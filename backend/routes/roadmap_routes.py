@@ -134,12 +134,10 @@ def update_progress(roadmap_id):
 def delete(roadmap_id):
     """Delete a roadmap."""
     user_id = int(get_jwt_identity())
-    from models import db, Roadmap
-    roadmap = Roadmap.query.get(roadmap_id)
+    from supabase_client import sb_select, sb_delete
+    roadmap = sb_select('roadmaps', match={'id': roadmap_id, 'user_id': user_id}, single=True)
     if not roadmap:
-        return jsonify({'error': 'Roadmap not found'}), 404
-    if roadmap.user_id != user_id:
-        return jsonify({'error': 'Access denied'}), 403
-    db.session.delete(roadmap)
-    db.session.commit()
+        return jsonify({'error': 'Roadmap not found or access denied'}), 404
+    
+    sb_delete('roadmaps', match={'id': roadmap_id})
     return jsonify({'message': 'Roadmap deleted'}), 200

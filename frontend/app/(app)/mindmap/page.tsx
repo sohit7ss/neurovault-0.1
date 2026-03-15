@@ -16,6 +16,7 @@ import {
   Panel,
   useReactFlow,
   ReactFlowProvider,
+  Position,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import dagre from 'dagre';
@@ -52,8 +53,8 @@ const getLayoutedElements = (nodes: Node[], edges: Edge[], direction = 'LR') => 
     const nodeWithPosition = dagreGraph.node(node.id);
     const newNode = { ...node };
 
-    newNode.targetPosition = isHorizontal ? 'left' : 'top';
-    newNode.sourcePosition = isHorizontal ? 'right' : 'bottom';
+    newNode.targetPosition = isHorizontal ? Position.Left : Position.Top;
+    newNode.sourcePosition = isHorizontal ? Position.Right : Position.Bottom;
     newNode.position = {
       x: nodeWithPosition.x - 180 / 2,
       y: nodeWithPosition.y - 50 / 2,
@@ -391,7 +392,7 @@ function FlowApp() {
             minZoom={0.1}
             maxZoom={2}
           >
-            <Background color="#ffffff" gap={20} size={1} opacity={0.05} />
+            <Background color="#ffffff" gap={20} size={1} style={{ opacity: 0.05 }} />
             <Controls style={{ display: 'flex', flexDirection: 'row', bottom: 10, left: 10, position: 'absolute' }} />
             
             {/* Top right panel tools */}

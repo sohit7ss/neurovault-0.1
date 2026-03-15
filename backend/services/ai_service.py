@@ -5,11 +5,29 @@ import pickle
 import logging
 import numpy as np
 from flask import current_app
-from models import db, Document, Embedding
 from error_handler import NotFoundError, ValidationError
 from security import sanitize_string
+from supabase_client import sb_select, sb_insert, sb_update, sb_delete
+from services.rate_limiter import gemini_rate_limiter
 
 logger = logging.getLogger(__name__)
+
+# Gemini Model Configuration
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_FALLBACK = "gemini-2.5-flash-lite"
+
+def call_gemini(model_obj, prompt, generation_config=None):
+    """Call Gemini with fallback logic."""
+    import google.generativeai as genai
+    gemini_rate_limiter.wait()
+    try:
+        # We assume model_obj is already initialized with GEMINI_MODEL
+        return model_obj.generate_content(prompt, generation_config=generation_config)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Primary model {GEMINI_MODEL} failed, trying fallback {GEMINI_FALLBACK}: {e}")
+        fallback_model = genai.GenerativeModel(GEMINI_FALLBACK)
+        return fallback_model.generate_content(prompt, generation_config=generation_config)
 
 # ---------- Vector Store Manager ----------
 
@@ -20,7 +38,7 @@ class VectorStoreManager:
         import os
         self.store_path = store_path
         self.metadata = []  # List of {user_id, document_id, chunk_index, chunk_text, embedding: list[float]}
-        self.dimension = 1536  # OpenAI dimension
+        self.dimension = 768  # Gemini default dimension
         os.makedirs(store_path, exist_ok=True)
         self._load_or_create()
     
@@ -52,36 +70,61 @@ class VectorStoreManager:
         except Exception as e:
             logger.error(f"Failed to save vector store: {e}")
     
-    def get_openai_client(self):
+    def get_huggingface_client(self):
         import os
-        from config import config_map
-        env = os.getenv('FLASK_ENV', 'development')
-        conf = config_map.get(env)
-        if not conf:
-            return None
-        api_key = conf.OPENAI_API_KEY
-        if api_key:
-            try:
-                from openai import OpenAI
-                return OpenAI(api_key=api_key)
-            except ImportError:
-                pass
-        return None
+        from flask import current_app
+        return current_app.config.get('HUGGINGFACE_API_KEY')
+        
+    def get_gemini_client(self):
+        import os
+        from flask import current_app
+        return current_app.config.get('GEMINI_API_KEY')
     
     def embed_texts(self, texts):
-        """Generate embeddings using OpenAI."""
-        client = self.get_openai_client()
-        if client:
+        """Generate embeddings using Gemini or Hugging Face Inference API."""
+        import requests
+        
+        # 1. Try Gemini first (Best quality, 768 dimensions)
+        gemini_key = self.get_gemini_client()
+        if gemini_key:
             try:
-                response = client.embeddings.create(
-                    input=texts,
-                    model="text-embedding-3-small"
+                import google.generativeai as genai
+                genai.configure(api_key=gemini_key)
+                # Using models/embedding-001 or text-embedding-004
+                result = genai.embed_content(
+                    model="models/embedding-001",
+                    content=texts,
+                    task_type="retrieval_document"
                 )
-                return [data.embedding for data in response.data]
-            except Exception:
-                pass
-        # Mock embedding (random) for development without ML libs
+                embeddings = result['embedding']
+                if embeddings and len(embeddings) > 0:
+                    self.dimension = len(embeddings[0])
+                    return embeddings
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Gemini embedding failed: {e}")
+                
+        # 2. Fallback to Hugging Face (384 dimensions)
+        hf_key = self.get_huggingface_client()
+        if hf_key:
+            try:
+                model_id = "sentence-transformers/all-MiniLM-L6-v2"
+                api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_id}"
+                headers = {"Authorization": f"Bearer {hf_key}"}
+                
+                response = requests.post(api_url, headers=headers, json={"inputs": texts})
+                if response.status_code == 200:
+                    embeddings = response.json()
+                    self.dimension = len(embeddings[0])
+                    return embeddings
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"HF embedding failed: {e}")
+        
+        # 3. Last resort Mock embedding (random) for development without ML libs
         import random
+        import logging
+        logging.getLogger(__name__).warning("Using RANDOM embeddings. Search will not work correctly.")
         return [[random.uniform(-1, 1) for _ in range(self.dimension)] for _ in texts]
     
     def add_chunks(self, user_id, document_id, chunks):
@@ -109,13 +152,19 @@ class VectorStoreManager:
         self._save()
         logger.info(f"Added {len(chunks)} chunks for user {user_id}, doc {document_id}")
     
-    def search(self, user_id, query_text, top_k=10):
-        """Search vector store filtered by user_id using pure Python Cosine Similarity."""
+    def search(self, user_id, query_text, top_k=10, document_ids=None):
+        """Search vector store filtered by user_id or document_ids using pure Python Cosine Similarity."""
         if not self.metadata:
             return []
             
-        user_docs = [m for m in self.metadata if m.get('user_id') == user_id]
-        if not user_docs:
+        if document_ids is not None:
+            # Search within a specific set of documents (e.g. workspace docs)
+            docs_to_search = [m for m in self.metadata if m.get('document_id') in document_ids]
+        else:
+            # Default to user's personal documents
+            docs_to_search = [m for m in self.metadata if m.get('user_id') == user_id]
+            
+        if not docs_to_search:
             return []
         
         query_embedding = self.embed_texts([query_text])[0]
@@ -129,11 +178,16 @@ class VectorStoreManager:
             return dot / (norm1 * norm2)
         
         results = []
-        for doc in user_docs:
+        for doc in docs_to_search:
             if 'embedding' not in doc:
                 continue
+            
+            # Handle dimension mismatch (e.g., if old random vectors had 1536 but new Gemini has 768)
+            if len(doc['embedding']) != len(query_embedding):
+                continue
+                
             sim = cosine_similarity(query_embedding, doc['embedding'])
-            # We treat distance as 1 - similarity so lower is better (like FAISS L2)
+            # We treat distance as 1 - similarity so lower is better (Like FAISS L2)
             dist = 1.0 - sim
             results.append({
                 'chunk_text': doc['chunk_text'],
@@ -220,16 +274,17 @@ def rewrite_query(query):
 
 def process_document_embeddings(user_id, document_id):
     """Process a document: chunk text and create embeddings."""
-    document = Document.query.get(document_id)
-    if not document or document.user_id != user_id:
+    document = sb_select('documents', eq=('id', document_id), single=True)
+    if not document or document.get('user_id') != user_id:
         raise NotFoundError("Document not found")
     
-    if not document.content_text:
+    content_text = document.get('content_text')
+    if not content_text:
         return {'message': 'No text content to process'}
     
     # Chunk the text
     chunks = chunk_text(
-        document.content_text,
+        content_text,
         chunk_size=current_app.config.get('CHUNK_SIZE', 500),
         overlap=current_app.config.get('CHUNK_OVERLAP', 50),
     )
@@ -238,20 +293,18 @@ def process_document_embeddings(user_id, document_id):
     vs = get_vector_store()
     vs.add_chunks(user_id, document_id, chunks)
     
-    # Save embedding metadata to DB
+    # Save embedding metadata to Supabase
     for i, chunk in enumerate(chunks):
-        emb = Embedding(
-            user_id=user_id,
-            document_id=document_id,
-            chunk_index=i,
-            chunk_text=chunk,
-            vector_id=f"{document_id}_{i}",
-        )
-        db.session.add(emb)
+        sb_insert('embeddings', {
+            'user_id': user_id,
+            'document_id': document_id,
+            'chunk_index': i,
+            'chunk_text': chunk,
+            'vector_id': f"{document_id}_{i}",
+        })
     
     # Update document status
-    document.status = 'ready'
-    db.session.commit()
+    sb_update('documents', match={'id': document_id}, data={'status': 'ready'})
     
     return {
         'message': f'Processed {len(chunks)} chunks',
@@ -259,8 +312,9 @@ def process_document_embeddings(user_id, document_id):
     }
 
 
-def query_documents(user_id, query, top_k=5):
-    """RAG query: hybrid search (vector + BM25) with query rewriting."""
+def query_documents(user_id, query, top_k=5, workspace_id=None):
+    """RAG query: hybrid search (vector + BM25) with query rewriting.
+    Falls back to general AI knowledge if no documents are found."""
     query = sanitize_string(query, 2000)
     if not query:
         raise ValidationError("Query cannot be empty")
@@ -268,12 +322,28 @@ def query_documents(user_id, query, top_k=5):
     # Query rewriting for better search
     expanded_query = rewrite_query(query)
     
+    document_ids = None
+    if workspace_id:
+        # Fetch all documents shared in this workspace
+        ws_docs = sb_select('workspace_documents', eq=('workspace_id', workspace_id))
+        document_ids = [d['document_id'] for d in (ws_docs or [])]
+        if not document_ids:
+            # If workspace has no documents, return empty RAG results immediately or fallback
+            return {
+                'answer': "This workspace has no shared documents to search from.",
+                'sources': [],
+                'query': query,
+                'mode': 'workspace_empty',
+            }
+
     vs = get_vector_store()
     
-    # Vector search with user isolation
+    # Vector search with user isolation or workspace document isolation
     vector_results = vs.search(
-        user_id, expanded_query,
-        top_k=current_app.config.get('TOP_K_RESULTS', 10)
+        user_id if not workspace_id else None, 
+        expanded_query,
+        top_k=current_app.config.get('TOP_K_RESULTS', 10),
+        document_ids=document_ids
     )
     
     # Merge results: deduplicate by (document_id, chunk_index)
@@ -286,11 +356,14 @@ def query_documents(user_id, query, top_k=5):
             r['source'] = 'vector'
             merged.append(r)
     
+    # ── FALLBACK: If no documents, use general AI knowledge ──
     if not merged:
+        general_answer = _general_ai_answer(query)
         return {
-            'answer': "I couldn't find relevant information in your documents. Try uploading more documents or rephrasing your query.",
+            'answer': general_answer,
             'sources': [],
             'query': query,
+            'mode': 'general_knowledge',
         }
     
     # Sort merged results by score
@@ -317,30 +390,79 @@ def query_documents(user_id, query, top_k=5):
     sources = []
     seen_docs = set()
     for r in top_results:
-        if r['document_id'] not in seen_docs:
-            doc = Document.query.get(r['document_id'])
+        doc_id = r['document_id']
+        if doc_id not in seen_docs:
+            doc = sb_select('documents', eq=('id', doc_id), single=True)
             if doc:
                 sources.append({
-                    'document_id': doc.id,
-                    'title': doc.title,
+                    'document_id': doc['id'],
+                    'title': doc['title'],
                     'relevance': r['score'],
                 })
-                seen_docs.add(r['document_id'])
+                seen_docs.add(doc_id)
     
     return {
         'answer': answer,
         'sources': sources,
         'query': query,
         'chunks_used': len(context_parts),
+        'mode': 'document_rag',
     }
+
+
+def _general_ai_answer(query):
+    """Generate an answer using general AI knowledge (no document context)."""
+    gemini_key = current_app.config.get('GEMINI_API_KEY', '')
+    
+    if gemini_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            
+            prompt = (
+                "You are NeuroVault, an expert AI knowledge assistant. "
+                "The user has no documents uploaded yet, so answer from your general knowledge. "
+                "Provide a comprehensive, highly-structured response.\n\n"
+                "Format your response in rich markdown:\n"
+                "- Use **bold** for key terms and *italics* for emphasis\n"
+                "- Use ## headings to organize sections\n"
+                "- Use bullet points and numbered lists\n"
+                "- Use LaTeX math with $...$ for inline and $$...$$ for display math\n"
+                "- Use ```language for code blocks\n"
+                "- Use > for important definitions or callouts\n"
+                "- Use tables when comparing items\n"
+                "- Be extremely thorough and educational, like a premium GPT model textbook explanation\n\n"
+                "At the end, add a note: '---\n\n"
+                "💡 *This answer is from general AI knowledge. "
+                "Upload your own documents for personalized, context-aware answers!*'\n\n"
+                f"Question: {query}"
+            )
+            
+            response = call_gemini(model, prompt)
+            return response.text
+        except Exception as e:
+            logger.error(f"Gemini general answer error: {e}")
+    
+    return (
+        f"## {query}\n\n"
+        "I don't have any documents uploaded to search through yet, "
+        "and the AI service is currently unavailable.\n\n"
+        "**To get the best experience:**\n"
+        "1. Upload your study materials, notes, or PDFs in the **Documents** section\n"
+        "2. Come back here and ask questions — I'll search through YOUR content\n"
+        "3. You'll get personalized, context-aware answers from your own knowledge base\n\n"
+        "---\n\n"
+        "*💡 Tip: Even without documents, I can answer general questions when the AI service is configured.*"
+    )
 
 
 def _generate_answer(query, context):
     """Generate answer using LLM. Falls back to smart extraction if no API key."""
-    openai_key = current_app.config.get('OPENAI_API_KEY', '')
+    gemini_key = current_app.config.get('GEMINI_API_KEY', '')
     
-    if openai_key:
-        result = _openai_answer(query, context, openai_key)
+    if gemini_key:
+        result = _gemini_answer(query, context, gemini_key)
         if result:
             return result
     
@@ -390,54 +512,40 @@ def _smart_local_answer(query, context):
         f"Based on your documents, here's what I found:\n\n"
         f"{answer_text}\n\n"
         f"---\n"
-        f"*💡 For AI-generated answers, add a valid OpenAI API key in your .env file.*"
+        f"*💡 For high-quality AI-generated answers, ensure your Gemini API key is valid in the .env file.*"
     )
 
 
-def _groq_answer(query, context, api_key):
-    """Generate answer using Groq API with rich markdown formatting."""
+def _gemini_answer(query, context, api_key):
+    """Generate answer using Gemini API with rich markdown formatting."""
     try:
-        import groq
-        import os
-        from config import config_map
-        env = os.getenv('FLASK_ENV', 'development')
-        model = config_map.get(env).GROQ_MODEL if config_map.get(env) else 'llama3-70b-8192'
+        import google.generativeai as genai
         
-        client = groq.Groq(api_key=api_key)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
         
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert AI assistant for a knowledge platform. "
-                        "Answer the user's question based on the provided context from their documents. "
-                        "Format your response in rich markdown:\n"
-                        "- Use **bold** for key terms and *italics* for emphasis\n"
-                        "- Use ## headings to organize sections\n"
-                        "- Use bullet points and numbered lists for clarity\n"
-                        "- Use LaTeX math notation with $ for inline (e.g. $E = mc^2$) and $$ for display math\n"
-                        "- Use ```language for code blocks\n"
-                        "- Use > for important quotes or definitions\n"
-                        "- Use tables when comparing items\n"
-                        "- Be thorough, educational, and well-structured like a textbook explanation\n"
-                        "- If formulas exist in the context, present them properly in LaTeX\n"
-                        "- Always provide clear, detailed explanations"
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"Context from my documents:\n{context}\n\nQuestion: {query}"
-                }
-            ],
-            max_tokens=1500,
-            temperature=0.4,
+        prompt = (
+            "You are an elite AI assistant for a premium knowledge platform. "
+            "Answer the user's question with utmost precision based ONLY on the provided context from their documents. "
+            "Format your response in rich markdown like a highly advanced GPT model:\n"
+            "- Use **bold** for key terms and *italics* for emphasis\n"
+            "- Use structured ## and ### headings to organize sections logically\n"
+            "- Use bullet points and numbered lists for clarity\n"
+            "- Use LaTeX math notation with $ for inline (e.g. $E = mc^2$) and $$ for display math\n"
+            "- Use ```language for code blocks\n"
+            "- Use > for important quotes or definitions\n"
+            "- Use markdown tables when comparing items or listing related data\n"
+            "- Extract maximum value from the context. Be highly thorough, educational, and well-structured.\n"
+            "- Do not hallucinate outside the context. If the answer isn't firmly in the text, clearly state that.\n\n"
+            f"Context from the user's documents:\n{context}\n\nQuestion: {query}"
         )
-        return response.choices[0].message.content
+        
+        response = call_gemini(model, prompt)
+        return response.text
     except Exception as e:
-        logger.error(f"Groq API error: {e}")
-        return None
+        import logging
+        logging.getLogger(__name__).error(f"Gemini API error: {e}")
+        return f"**Gemini API Error:**\n\n```text\n{str(e)}\n```\n\nPlease check your API key, region, and quotas."
 
 
 # ---------- Roadmap Generator ----------
@@ -451,168 +559,368 @@ def generate_roadmap(user_id, goal, level='beginner', time_available='2 hours/da
     if not goal:
         raise ValidationError("Goal is required")
     
-    openai_key = current_app.config.get('OPENAI_API_KEY', '')
+    openrouter_key = current_app.config.get('OPENROUTER_API_KEY', '')
+    gemini_key = current_app.config.get('GEMINI_API_KEY', '')
     
-    if openai_key:
-        roadmap_data = _openai_roadmap(goal, level, time_available, openai_key)
+    if openrouter_key:
+        roadmap_data = _openrouter_roadmap(goal, level, time_available, openrouter_key)
+    elif gemini_key:
+        roadmap_data = _gemini_roadmap(goal, level, time_available, gemini_key)
     else:
-        roadmap_data = _mock_roadmap(goal, level, time_available)
+        roadmap_data = _smart_mock_roadmap(goal, level, time_available)
     
-    # Save to DB
-    from models import Roadmap
-    roadmap = Roadmap(
-        user_id=user_id,
-        goal=goal,
-        level=level,
-        time_available=time_available,
-        roadmap_data=roadmap_data,
-        progress=0.0,
-    )
-    db.session.add(roadmap)
-    db.session.commit()
+    # Save to Supabase
+    res = sb_insert('roadmaps', {
+        'user_id': user_id,
+        'goal': goal,
+        'level': level,
+        'time_available': time_available,
+        'roadmap_data': roadmap_data,
+        'progress': 0.0,
+    })
     
-    return roadmap.to_dict()
+    roadmap = res.data[0] if res.data else None
+    return roadmap
 
 
-def _mock_roadmap(goal, level, time_available):
-    """Generate a mock roadmap with resources and estimated hours."""
+def _gemini_roadmap(goal, level, time_available, api_key):
+    """Generate a comprehensive roadmap using Gemini API."""
+    try:
+        import google.generativeai as genai
+        import json
+        
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        
+        prompt = (
+            "You are a world-class curriculum designer. Create an extremely detailed learning roadmap strictly tailored to the requested user level.\n\n"
+            f"TOPIC: {goal}\nLEVEL: {level}\nTIME: {time_available}\n\n"
+            "CRITICAL INSTRUCTION: You MUST strictly adapt the content depth, complexity, math, and scope to the specified LEVEL. "
+            "If the level is a school grade (e.g., 'class 10', 'high school') or 'beginner', DO NOT include advanced university-level or professional topics. "
+            "Keep the explanations, subtopics, and resources perfectly aligned with the target audience's grade or proficiency level, simplifying concepts where necessary.\n\n"
+            "Create 5-6 phases, each with 4-6 specific topics. Each topic must have:\n"
+            "- Specific title (NOT generic like 'Core Concepts')\n"
+            "- Description of what it covers\n"
+            "- List of subtopics (3-5 items)\n"
+            "- 2-4 resources with REAL URLs:\n"
+            "  * YouTube: https://youtube.com/results?search_query=ENCODED+TOPIC\n"
+            "  * Docs: official documentation URLs\n"
+            "  * Free courses: freeCodeCamp, Khan Academy, Coursera, MIT OCW\n"
+            "  * Practice: LeetCode, HackerRank, GeeksForGeeks\n"
+            "- Difficulty level (easy/medium/hard)\n"
+            "- Estimated hours\n\n"
+            "Return ONLY valid JSON:\n"
+            '{"title": "...", "total_estimated_hours": N, '
+            '"phases": [{"id": "phase-1", "title": "...", '
+            '"description": "...", "prerequisites": "...", '
+            '"duration": "X weeks", "estimated_hours": N, "status": "not_started", '
+            '"topics": [{"title": "...", "description": "...", '
+            '"subtopics": ["..."], "completed": false, '
+            '"estimated_hours": N, "difficulty": "easy|medium|hard", '
+            '"resources": [{"type": "video|course|docs|article|practice", '
+            '"title": "...", "url": "https://..."}]}]}]}'
+        )
+        
+        response = call_gemini(model, prompt)
+        text = response.text.strip()
+        
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            import re
+            match = re.search(r'```(?:json)?\s*(.*?)```', text, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+            # Try finding JSON object
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+    except Exception as e:
+        logger.error(f"Gemini roadmap failed: {e}")
+    
+    return _smart_mock_roadmap(goal, level, time_available)
+
+
+def _smart_mock_roadmap(goal, level, time_available):
+    """Generate a detailed mock roadmap with topic-aware content and real resource URLs."""
+    import urllib.parse
+    g = goal.strip()
+    q = urllib.parse.quote_plus(g)
+    
     return {
-        'title': f'Roadmap: {goal}',
-        'total_estimated_hours': 120,
+        'title': f'Complete Learning Roadmap: {g}',
+        'total_estimated_hours': 160,
         'phases': [
             {
                 'id': 'phase-1',
-                'title': 'Foundation',
-                'description': f'Build core fundamentals for {goal}',
+                'title': f'Foundation & Setup',
+                'description': f'Build a strong foundation in {g}. Understand the core concepts, terminology, history, and set up your learning environment.',
+                'prerequisites': 'Basic computer literacy, curiosity to learn',
                 'duration': '2-3 weeks',
-                'estimated_hours': 20,
+                'estimated_hours': 25,
                 'status': 'not_started',
                 'topics': [
                     {
-                        'title': 'Core Concepts',
+                        'title': f'Introduction to {g}',
+                        'description': f'Understand what {g} is, its history, why it matters, and where it is used in the real world.',
+                        'subtopics': [f'What is {g}?', f'History & Evolution of {g}', f'Real-world applications', 'Key terminology & jargon', 'Community & ecosystem overview'],
+                        'completed': False,
+                        'estimated_hours': 6,
+                        'difficulty': 'easy',
+                        'resources': [
+                            {'type': 'video', 'title': f'{g} Crash Course for Beginners', 'url': f'https://youtube.com/results?search_query={q}+crash+course+beginners'},
+                            {'type': 'article', 'title': f'{g} Overview - Wikipedia', 'url': f'https://en.wikipedia.org/wiki/{q}'},
+                            {'type': 'article', 'title': f'Introduction to {g} - GeeksForGeeks', 'url': f'https://www.geeksforgeeks.org/{q.lower().replace("+", "-")}/'},
+                        ]
+                    },
+                    {
+                        'title': f'Resources & Setup',
+                        'description': f'Gather the necessary materials, books, software, or tools required to master {g}.',
+                        'subtopics': ['Resource gathering', 'Identifying primary sources', 'Organizing your study space', 'Finding community forums', 'Bookmarking essential references'],
+                        'completed': False,
+                        'estimated_hours': 5,
+                        'difficulty': 'easy',
+                        'resources': [
+                            {'type': 'video', 'title': f'Best tools for {g}', 'url': f'https://youtube.com/results?search_query={q}+best+resources+tools'},
+                            {'type': 'docs', 'title': f'Essential {g} Guide', 'url': f'https://www.google.com/search?q={q}+essential+getting+started+guide'},
+                        ]
+                    },
+                    {
+                        'title': f'Core Fundamentals of {g}',
+                        'description': f'Learn the essential building blocks that everything else in {g} is built upon.',
+                        'subtopics': [f'Basic {g} concepts', 'Fundamental principles', 'Common patterns', 'Hands-on first examples', 'Troubleshooting basics'],
                         'completed': False,
                         'estimated_hours': 8,
+                        'difficulty': 'easy',
                         'resources': [
-                            {'type': 'video', 'title': 'Introduction Course', 'url': 'https://youtube.com'},
-                            {'type': 'book', 'title': 'Getting Started Guide', 'url': ''},
+                            {'type': 'course', 'title': f'{g} Fundamentals - freeCodeCamp', 'url': f'https://www.freecodecamp.org/news/tag/{q.lower().replace("+", "-")}/'},
+                            {'type': 'video', 'title': f'{g} Full Course for Beginners', 'url': f'https://youtube.com/results?search_query={q}+full+course+beginners+freeCodeCamp'},
+                            {'type': 'practice', 'title': f'Practice {g} - W3Schools', 'url': f'https://www.w3schools.com/{q.lower().split("+")[0]}/'},
                         ]
                     },
                     {
-                        'title': 'Basic Terminology',
+                        'title': 'First Mini-Project',
+                        'description': f'Apply what you\'ve learned by building a small, guided project using basic {g} concepts.',
+                        'subtopics': ['Project planning', 'Step-by-step implementation', 'Testing your work', 'Common pitfalls to avoid'],
                         'completed': False,
                         'estimated_hours': 6,
+                        'difficulty': 'easy',
                         'resources': [
-                            {'type': 'article', 'title': 'Key Terms Glossary', 'url': ''},
-                        ]
-                    },
-                    {
-                        'title': 'Environment Setup',
-                        'completed': False,
-                        'estimated_hours': 6,
-                        'resources': [
-                            {'type': 'tutorial', 'title': 'Setup Tutorial', 'url': ''},
+                            {'type': 'project', 'title': f'{g} Beginner Project Ideas', 'url': f'https://youtube.com/results?search_query={q}+beginner+project+tutorial'},
+                            {'type': 'article', 'title': f'Top {g} Projects for Beginners', 'url': f'https://www.google.com/search?q=best+{q}+beginner+projects'},
                         ]
                     },
                 ]
             },
             {
                 'id': 'phase-2',
-                'title': 'Core Skills',
-                'description': f'Develop essential skills for {goal}',
+                'title': 'Intermediate Concepts',
+                'description': f'Deepen your understanding of {g} with intermediate-level concepts and techniques.',
+                'prerequisites': 'Phase 1 completed',
                 'duration': '3-4 weeks',
-                'estimated_hours': 30,
+                'estimated_hours': 35,
                 'status': 'not_started',
                 'topics': [
                     {
-                        'title': 'Intermediate Concepts',
+                        'title': f'Intermediate {g} Techniques',
+                        'description': f'Move beyond basics to learn powerful patterns and techniques used in real {g} work.',
+                        'subtopics': ['Design patterns', 'Advanced syntax/features', 'Error handling', 'Performance basics', 'Code organization'],
                         'completed': False,
                         'estimated_hours': 10,
+                        'difficulty': 'medium',
                         'resources': [
-                            {'type': 'course', 'title': 'Intermediate Course', 'url': ''},
+                            {'type': 'course', 'title': f'Intermediate {g} Course', 'url': f'https://youtube.com/results?search_query={q}+intermediate+course'},
+                            {'type': 'article', 'title': f'{g} Best Practices', 'url': f'https://www.google.com/search?q={q}+best+practices+guide'},
                         ]
                     },
                     {
-                        'title': 'Practical Exercises',
+                        'title': f'Practical Applications of {g}',
+                        'description': f'Learn how to solve complex problems and apply {g} in practical, real-world scenarios.',
+                        'subtopics': ['Common use cases', 'Problem-solving strategies', 'Case studies', 'Best practices', 'Applied examples'],
                         'completed': False,
                         'estimated_hours': 10,
+                        'difficulty': 'medium',
                         'resources': [
-                            {'type': 'practice', 'title': 'Exercise Platform', 'url': ''},
+                            {'type': 'practice', 'title': f'Applied {g} Exercises', 'url': f'https://www.google.com/search?q={q}+practice+exercises'},
+                            {'type': 'video', 'title': f'Real-world {g} Examples', 'url': f'https://youtube.com/results?search_query={q}+real+world+examples'},
                         ]
                     },
                     {
-                        'title': 'Mini Projects',
+                        'title': f'Evaluation & Validation in {g}',
+                        'description': f'Learn how to evaluate your understanding, test your work, and ensure quality.',
+                        'subtopics': ['Self-assessment techniques', 'Peer review', 'Critique methods', 'Common mistakes to avoid'],
                         'completed': False,
-                        'estimated_hours': 10,
+                        'estimated_hours': 8,
+                        'difficulty': 'medium',
                         'resources': [
-                            {'type': 'project', 'title': 'Project Ideas', 'url': ''},
+                            {'type': 'video', 'title': f'{g} Common Mistakes', 'url': f'https://youtube.com/results?search_query={q}+common+mistakes'},
+                            {'type': 'article', 'title': f'Evaluating {g} Quality', 'url': f'https://www.google.com/search?q=how+to+evaluate+{q}'},
+                        ]
+                    },
+                    {
+                        'title': 'Intermediate Projects',
+                        'description': f'Build 2-3 intermediate projects that combine multiple {g} concepts.',
+                        'subtopics': ['Project scoping', 'Architecture decisions', 'Building from scratch', 'Code review & refactoring', 'Documentation'],
+                        'completed': False,
+                        'estimated_hours': 7,
+                        'difficulty': 'medium',
+                        'resources': [
+                            {'type': 'project', 'title': f'{g} Intermediate Projects', 'url': f'https://youtube.com/results?search_query={q}+intermediate+project+tutorial'},
+                            {'type': 'article', 'title': f'Project Ideas for {g}', 'url': f'https://www.google.com/search?q={q}+intermediate+project+ideas'},
                         ]
                     },
                 ]
             },
             {
                 'id': 'phase-3',
-                'title': 'Advanced Topics',
-                'description': f'Master advanced aspects of {goal}',
+                'title': 'Advanced Mastery',
+                'description': f'Master advanced {g} concepts, optimization, and professional-grade techniques.',
+                'prerequisites': 'Phase 2 completed',
                 'duration': '4-6 weeks',
-                'estimated_hours': 35,
+                'estimated_hours': 40,
                 'status': 'not_started',
                 'topics': [
                     {
-                        'title': 'Advanced Theory',
+                        'title': f'Advanced {g} Patterns & Architecture',
+                        'description': f'Study advanced design patterns, system architecture, and scalable approaches in {g}.',
+                        'subtopics': ['Advanced design patterns', 'System architecture', 'Scalability', 'Security considerations', 'Performance optimization'],
                         'completed': False,
                         'estimated_hours': 12,
+                        'difficulty': 'hard',
                         'resources': [
-                            {'type': 'book', 'title': 'Advanced Reference', 'url': ''},
+                            {'type': 'course', 'title': f'Advanced {g} - MIT OCW', 'url': f'https://ocw.mit.edu/search/?q={q}'},
+                            {'type': 'video', 'title': f'Advanced {g} Concepts', 'url': f'https://youtube.com/results?search_query={q}+advanced+concepts+tutorial'},
+                            {'type': 'article', 'title': f'Advanced {g} Patterns', 'url': f'https://www.google.com/search?q=advanced+{q}+design+patterns'},
                         ]
                     },
                     {
-                        'title': 'Complex Projects',
+                        'title': f'Performance & Optimization',
+                        'description': f'Learn to profile, benchmark, and optimize {g} code for production.',
+                        'subtopics': ['Profiling tools', 'Memory optimization', 'Speed optimization', 'Caching strategies', 'Monitoring & observability'],
                         'completed': False,
-                        'estimated_hours': 15,
+                        'estimated_hours': 10,
+                        'difficulty': 'hard',
                         'resources': [
-                            {'type': 'project', 'title': 'Capstone Project Guide', 'url': ''},
+                            {'type': 'video', 'title': f'{g} Performance Optimization', 'url': f'https://youtube.com/results?search_query={q}+performance+optimization'},
+                            {'type': 'article', 'title': f'Performance Tips for {g}', 'url': f'https://www.google.com/search?q={q}+performance+optimization+tips'},
                         ]
                     },
                     {
-                        'title': 'Best Practices',
+                        'title': 'Capstone Project',
+                        'description': f'Build a significant, portfolio-worthy project showcasing your {g} expertise.',
+                        'subtopics': ['Project planning & design', 'Full implementation', 'Deployment', 'Documentation', 'Code review'],
                         'completed': False,
-                        'estimated_hours': 8,
+                        'estimated_hours': 18,
+                        'difficulty': 'hard',
                         'resources': [
-                            {'type': 'article', 'title': 'Industry Best Practices', 'url': ''},
+                            {'type': 'project', 'title': f'Advanced {g} Project Ideas', 'url': f'https://youtube.com/results?search_query={q}+advanced+project'},
+                            {'type': 'article', 'title': f'Portfolio Project Ideas for {g}', 'url': f'https://dev.to/search?q={q}+project'},
                         ]
                     },
                 ]
             },
             {
                 'id': 'phase-4',
-                'title': 'Real-World Application',
-                'description': f'Apply {goal} skills to real projects',
-                'duration': '4-8 weeks',
-                'estimated_hours': 35,
+                'title': 'Professional Development & Career',
+                'description': f'Prepare for professional work with {g}: industry standards, interviews, and career growth.',
+                'prerequisites': 'Phase 3 completed',
+                'duration': '3-4 weeks',
+                'estimated_hours': 30,
                 'status': 'not_started',
                 'topics': [
                     {
-                        'title': 'Portfolio Project',
+                        'title': f'{g} in the Industry / Advanced Context',
+                        'description': f'Learn how {g} is utilized in professional, academic, or high-level environments.',
+                        'subtopics': ['Industry workflows', 'Academic importance', 'Collaboration', 'Research frontiers'],
+                        'completed': False,
+                        'estimated_hours': 8,
+                        'difficulty': 'medium',
+                        'resources': [
+                            {'type': 'article', 'title': f'{g} Industry Best Practices', 'url': f'https://www.google.com/search?q={q}+industry+best+practices'},
+                            {'type': 'video', 'title': f'{g} Applications', 'url': f'https://youtube.com/results?search_query={q}+real+world+applications'},
+                        ]
+                    },
+                    {
+                        'title': f'Assessment & Proficiency Check for {g}',
+                        'description': f'Rigorous testing of your advanced {g} concepts and mastery.',
+                        'subtopics': ['Advanced problem sets', 'Theoretical challenges', 'Practical implementation', 'Peer discussions'],
+                        'completed': False,
+                        'estimated_hours': 10,
+                        'difficulty': 'hard',
+                        'resources': [
+                            {'type': 'practice', 'title': f'{g} Advanced Practice', 'url': f'https://www.google.com/search?q={q}+advanced+practice'},
+                            {'type': 'video', 'title': f'{g} Expert Explanations', 'url': f'https://youtube.com/results?search_query={q}+expert+level'},
+                        ]
+                    },
+                    {
+                        'title': 'Community Contribution & Sharing',
+                        'description': f'Learn to contribute to the {g} community, share knowledge, and build your reputation.',
+                        'subtopics': ['Finding discussion forums', 'Reading advanced literature', 'Presenting findings', 'Answering questions'],
+                        'completed': False,
+                        'estimated_hours': 8,
+                        'difficulty': 'medium',
+                        'resources': [
+                            {'type': 'article', 'title': f'Contributing to {g}', 'url': f'https://www.google.com/search?q=contribute+to+{q}'},
+                            {'type': 'video', 'title': 'How to Share Knowledge', 'url': 'https://youtube.com/results?search_query=how+to+teach+what+you+learn'},
+                        ]
+                    },
+                    {
+                        'title': 'Building Your Portfolio & Resume',
+                        'description': 'Create a compelling portfolio and resume showcasing your skills.',
+                        'subtopics': ['Portfolio website', 'Project showcase', 'Resume writing', 'LinkedIn optimization', 'Networking strategies'],
+                        'completed': False,
+                        'estimated_hours': 4,
+                        'difficulty': 'easy',
+                        'resources': [
+                            {'type': 'article', 'title': 'How to Build a Developer Portfolio', 'url': 'https://www.freecodecamp.org/news/how-to-build-a-developer-portfolio-website/'},
+                            {'type': 'video', 'title': 'Portfolio Building Tutorial', 'url': 'https://youtube.com/results?search_query=developer+portfolio+website+tutorial'},
+                        ]
+                    },
+                ]
+            },
+            {
+                'id': 'phase-5',
+                'title': 'Continuous Learning & Specialization',
+                'description': f'Stay current with {g} developments and choose a specialization path.',
+                'prerequisites': 'Phase 4 completed',
+                'duration': 'Ongoing',
+                'estimated_hours': 30,
+                'status': 'not_started',
+                'topics': [
+                    {
+                        'title': f'Staying Updated with {g}',
+                        'description': f'Build habits for keeping up with the latest in {g}.',
+                        'subtopics': ['Following key blogs & newsletters', 'Attending conferences/meetups', 'Reading release notes', 'Twitter/Reddit communities', 'Podcasts'],
+                        'completed': False,
+                        'estimated_hours': 5,
+                        'difficulty': 'easy',
+                        'resources': [
+                            {'type': 'article', 'title': f'{g} Communities on Reddit', 'url': f'https://www.reddit.com/search/?q={q}'},
+                            {'type': 'article', 'title': f'{g} News & Updates', 'url': f'https://dev.to/t/{q.lower().split("+")[0]}'},
+                        ]
+                    },
+                    {
+                        'title': f'Specialization in {g}',
+                        'description': f'Pick a niche within {g} to specialize in and become an expert.',
+                        'subtopics': ['Choose a specialization', 'Deep-dive learning', 'Building expertise', 'Speaking/writing about it', 'Mentoring others'],
                         'completed': False,
                         'estimated_hours': 15,
+                        'difficulty': 'hard',
                         'resources': [
-                            {'type': 'project', 'title': 'Portfolio Showcase', 'url': ''},
+                            {'type': 'article', 'title': f'{g} Career Paths & Specializations', 'url': f'https://www.google.com/search?q={q}+career+paths+specializations'},
+                            {'type': 'video', 'title': f'{g} Career Roadmap', 'url': f'https://youtube.com/results?search_query={q}+career+roadmap+2024'},
                         ]
                     },
                     {
-                        'title': 'Industry Standards',
+                        'title': 'Teaching & Mentoring',
+                        'description': f'Solidify your expertise by teaching and mentoring others in {g}.',
+                        'subtopics': ['Creating tutorials', 'Blogging about ' + g, 'Mentoring beginners', 'Stack Overflow contributions', 'Community leadership'],
                         'completed': False,
                         'estimated_hours': 10,
+                        'difficulty': 'medium',
                         'resources': [
-                            {'type': 'article', 'title': 'Industry Guidelines', 'url': ''},
-                        ]
-                    },
-                    {
-                        'title': 'Career Preparation',
-                        'completed': False,
-                        'estimated_hours': 10,
-                        'resources': [
-                            {'type': 'course', 'title': 'Interview Prep Course', 'url': ''},
+                            {'type': 'article', 'title': 'How to Write Technical Tutorials', 'url': 'https://www.freecodecamp.org/news/how-to-write-a-technical-blog-post/'},
+                            {'type': 'article', 'title': 'Becoming a Tech Mentor', 'url': 'https://www.google.com/search?q=how+to+become+a+tech+mentor'},
                         ]
                     },
                 ]
@@ -621,100 +929,122 @@ def _mock_roadmap(goal, level, time_available):
     }
 
 
-def _openai_roadmap(goal, level, time_available, api_key):
-    """Generate comprehensive roadmap using OpenAI."""
+def _mock_roadmap(goal, level, time_available):
+    """Backward-compatible wrapper."""
+    return _smart_mock_roadmap(goal, level, time_available)
+
+
+def _openrouter_roadmap(goal, level, time_available, api_key):
+    """Generate comprehensive roadmap using OpenRouter API."""
     try:
-        import openai
-        client = openai.OpenAI(api_key=api_key)
+        import requests
+        import json
+        from flask import current_app
         
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert learning coach and curriculum designer. "
-                        "Generate a highly detailed, actionable learning roadmap in JSON format. "
-                        "Each phase should have specific, domain-accurate topics with real resource recommendations. "
-                        "Make it feel like a professional course syllabus. "
-                        "Return ONLY valid JSON with this structure: "
-                        '{"title": "...", "total_estimated_hours": 120, '
-                        '"phases": [{"id": "phase-1", "title": "...", '
-                        '"description": "Detailed description", '
-                        '"duration": "X weeks", "estimated_hours": 20, "status": "not_started", '
-                        '"topics": [{"title": "Specific Topic", "completed": false, '
-                        '"estimated_hours": 5, '
-                        '"resources": [{"type": "video|book|course|article|practice|project", '
-                        '"title": "Resource Name", "url": "https://..."}]}]}]}'
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Create a comprehensive learning roadmap:\n"
-                        f"Goal: {goal}\n"
-                        f"Current Level: {level}\n"
-                        f"Time Available: {time_available}\n\n"
-                        f"Requirements:\n"
-                        f"- Create 5-7 detailed phases from fundamentals to mastery\n"
-                        f"- Each phase should have 5-8 specific topics\n"
-                        f"- Topics should include specific technologies, frameworks, tools\n"
-                        f"- Include hands-on projects in each phase\n"
-                        f"- Add estimated hours for EACH topic (realistic numbers!)\n"
-                        f"- Add estimated_hours total for each phase\n"
-                        f"- Add 1-3 real resource links (YouTube, docs, courses) per topic\n"
-                        f"- total_estimated_hours should be the sum of all phase hours\n"
-                        f"- Make difficulty progressively increase\n"
-                        f"- Include real-world applicable skills"
-                    )
-                }
-            ],
-            max_tokens=3500,
-            temperature=0.6,
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": current_app.config.get("FRONTEND_URL", "http://localhost:3000"),
+            "X-Title": "NeuroVault",
+            "Content-Type": "application/json"
+        }
+        
+        prompt = (
+            "You are a world-class curriculum designer and learning coach with deep expertise across all fields. "
+            "Create an extremely detailed, comprehensive, and actionable learning roadmap.\n\n"
+            "CRITICAL REQUIREMENTS:\n"
+            f"- TOPIC: {goal}\n"
+            f"- LEVEL: {level}\n"
+            f"- TIME: {time_available}\n\n"
+            "INSTRUCTIONS (follow exactly):\n"
+            "1. Create 5-6 learning phases, each with 4-6 specific topics\n"
+            "2. Each topic must list ALL important subtopics the learner needs to master\n"
+            "3. Each topic MUST have 2-4 resources with REAL, working URLs:\n"
+            "   - YouTube tutorials (use https://youtube.com/results?search_query=TOPIC+tutorial)\n"
+            "   - Documentation (official docs like MDN, Python docs, React docs, etc.)\n"
+            "   - Free courses (freeCodeCamp, Khan Academy, Coursera, MIT OCW)\n"
+            "   - Practice sites (LeetCode, HackerRank, Exercism, Codecademy)\n"
+            "   - Articles (Medium, Dev.to, GeeksForGeeks, W3Schools)\n"
+            "4. Topics must be specific, NOT generic (e.g., 'Variables, Data Types & Operators' not 'Core Concepts')\n"
+            "5. Include prerequisites, difficulty estimate, and a clear description for each phase\n"
+            "6. Estimated hours must be realistic for the user's available time\n\n"
+            "Return ONLY valid JSON (no markdown, no explanation) with this structure:\n"
+            '{"title": "Complete Roadmap: TOPIC", "total_estimated_hours": N, '
+            '"phases": [{"id": "phase-1", "title": "Phase Title", '
+            '"description": "Detailed description of what learner will achieve", '
+            '"prerequisites": "What learner needs before this phase", '
+            '"duration": "X-Y weeks", "estimated_hours": N, "status": "not_started", '
+            '"topics": [{"title": "Specific Topic Name", '
+            '"description": "What this covers and why it matters", '
+            '"subtopics": ["Subtopic 1", "Subtopic 2", "Subtopic 3"], '
+            '"completed": false, "estimated_hours": N, '
+            '"difficulty": "easy|medium|hard", '
+            '"resources": [{"type": "video|book|course|article|practice|project|docs", '
+            '"title": "Resource Name", "url": "https://actual-url.com/..."}]}]}]}'
         )
         
-        result = response.choices[0].message.content
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            import re
-            match = re.search(r'```(?:json)?\s*(.*?)```', result, re.DOTALL)
-            if match:
-                return json.loads(match.group(1))
-            return _mock_roadmap(goal, level, time_available)
+        data = {
+            "model": "mistralai/mixtral-8x7b-instruct",
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.4,
+            "max_tokens": 4000
+        }
+        
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
+        if response.status_code == 200:
+            result = response.json()['choices'][0]['message']['content']
+            try:
+                return json.loads(result)
+            except json.JSONDecodeError:
+                import re
+                match = re.search(r'```(?:json)?\s*(.*?)```', result, re.DOTALL)
+                if match:
+                    return json.loads(match.group(1))
+        
+        # If OpenRouter fails, try Gemini
+        gemini_key = current_app.config.get('GEMINI_API_KEY', '')
+        if gemini_key:
+            return _gemini_roadmap(goal, level, time_available, gemini_key)
+        return _smart_mock_roadmap(goal, level, time_available)
     except Exception as e:
-        logger.error(f"OpenAI roadmap generation failed: {e}")
-        return _mock_roadmap(goal, level, time_available)
+        logger.error(f"OpenRouter roadmap generation failed: {e}")
+        gemini_key = current_app.config.get('GEMINI_API_KEY', '')
+        if gemini_key:
+            return _gemini_roadmap(goal, level, time_available, gemini_key)
+        return _smart_mock_roadmap(goal, level, time_available)
 
 
 def get_roadmap(user_id, roadmap_id):
     """Get a roadmap with ownership check."""
-    from models import Roadmap
-    roadmap = Roadmap.query.get(roadmap_id)
+    roadmap = sb_select('roadmaps', eq=('id', roadmap_id), single=True)
     if not roadmap:
         raise NotFoundError("Roadmap not found")
-    if roadmap.user_id != user_id:
+    if roadmap.get('user_id') != user_id:
         from error_handler import ForbiddenError
         raise ForbiddenError("Access denied")
-    return roadmap.to_dict()
+    return roadmap
 
 
 def get_user_roadmaps(user_id):
     """Get all roadmaps for a user."""
-    from models import Roadmap
-    roadmaps = Roadmap.query.filter_by(user_id=user_id) \
-        .order_by(Roadmap.created_at.desc()).all()
-    return [r.to_dict() for r in roadmaps]
+    # Supabase select ordered by created_at DESC
+    from supabase_client import get_supabase
+    res = get_supabase().table('roadmaps') \
+        .select("*") \
+        .eq('user_id', user_id) \
+        .order('created_at', desc=True) \
+        .execute()
+    return res.data
 
 
 def update_roadmap_progress(user_id, roadmap_id, phase_id, topic_index, completed):
     """Update progress on a roadmap topic."""
-    from models import Roadmap
-    roadmap = Roadmap.query.get(roadmap_id)
-    if not roadmap or roadmap.user_id != user_id:
+    roadmap = sb_select('roadmaps', eq=('id', roadmap_id), single=True)
+    if not roadmap or roadmap.get('user_id') != user_id:
         raise NotFoundError("Roadmap not found")
     
-    data = roadmap.roadmap_data
+    data = roadmap.get('roadmap_data', {})
     if data and 'phases' in data:
         for phase in data['phases']:
             if phase['id'] == phase_id and topic_index < len(phase.get('topics', [])):
@@ -730,8 +1060,12 @@ def update_roadmap_progress(user_id, roadmap_id, phase_id, topic_index, complete
                 if topic.get('completed'):
                     done += 1
         
-        roadmap.roadmap_data = data
-        roadmap.progress = (done / total * 100) if total > 0 else 0
-        db.session.commit()
+        new_progress = (done / total * 100) if total > 0 else 0
+        sb_update('roadmaps', match={'id': roadmap_id}, data={
+            'roadmap_data': data,
+            'progress': new_progress
+        })
+        roadmap['roadmap_data'] = data
+        roadmap['progress'] = new_progress
     
-    return roadmap.to_dict()
+    return roadmap

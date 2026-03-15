@@ -44,8 +44,14 @@ def register():
     password = data.get('password', '')
     name = data.get('name', '')
     
-    result = register_user(email, password, name)
-    return jsonify(result), 201
+    try:
+        result = register_user(email, password, name)
+        return jsonify(result), 201
+    except Exception as e:
+        error_msg = str(e)
+        if "rls policy" in error_msg.lower() or "42501" in error_msg:
+            return jsonify({'error': 'Database permission error. Please ensure Supabase RLS policies are configured.'}), 403
+        return jsonify({'error': error_msg}), 400
 
 
 @auth_bp.route('/login', methods=['POST'])
@@ -82,8 +88,16 @@ def login():
     email = data.get('email', '')
     password = data.get('password', '')
     
-    result = login_user(email, password)
-    return jsonify(result), 200
+    try:
+        result = login_user(email, password)
+        return jsonify(result), 200
+    except Exception as e:
+        error_msg = str(e)
+        if "rls policy" in error_msg.lower() or "42501" in error_msg:
+            return jsonify({'error': 'Database permission error.'}), 403
+        if "invalid" in error_msg.lower() or "unauthorized" in error_msg.lower():
+            return jsonify({'error': error_msg}), 401
+        return jsonify({'error': error_msg}), 400
 
 
 @auth_bp.route('/profile', methods=['GET'])

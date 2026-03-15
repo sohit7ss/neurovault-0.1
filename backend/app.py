@@ -34,8 +34,7 @@ def create_app(config=None):
     # ---------- Extensions ----------
     
     # CORS
-    CORS(app, origins=[app.config.get('FRONTEND_URL', 'http://localhost:3000')],
-         supports_credentials=True)
+    CORS(app, origins=["*"], supports_credentials=True)
     
     # Database
     db.init_app(app)
@@ -78,6 +77,7 @@ def create_app(config=None):
     from routes.roadmap_routes import roadmap_bp
     from routes.intelligence_routes import intelligence_bp
     from routes.collaboration_routes import collab_bp
+    from routes.dashboard_routes import dashboard_bp
     
     app.register_blueprint(auth_bp)
     app.register_blueprint(document_bp)
@@ -85,6 +85,8 @@ def create_app(config=None):
     app.register_blueprint(roadmap_bp)
     app.register_blueprint(intelligence_bp)
     app.register_blueprint(collab_bp)
+    app.register_blueprint(dashboard_bp)
+
     
     # Apply rate limits per category
     limiter.limit(app.config.get('RATE_LIMIT_AUTH', '5/minute'))(auth_bp)

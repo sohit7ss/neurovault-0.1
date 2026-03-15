@@ -4,10 +4,11 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from services.intelligence_service import (
     generate_mind_map, generate_knowledge_graph,
     generate_quiz, summarize_document, explain_concept,
+    generate_tutor_followup,
     save_mind_map, get_user_mind_maps, get_mind_map,
     update_mind_map, delete_mind_map, convert_mindmap_to_roadmap,
 )
-from models import db, Document
+from supabase_client import sb_select, sb_insert, get_supabase
 
 intelligence_bp = Blueprint('intelligence', __name__, url_prefix='/api/intelligence')
 
@@ -56,8 +57,8 @@ def create_mind_map():
     # Optionally use user's documents for context
     docs = []
     if data.get('use_documents'):
-        user_docs = Document.query.filter_by(user_id=user_id).all()
-        docs = [{'id': d.id, 'title': d.title, 'content_text': d.content_text} for d in user_docs]
+        user_docs = sb_select('documents', eq=('user_id', user_id))
+        docs = [{'id': d['id'], 'title': d['title'], 'content_text': d['content_text']} for d in user_docs]
     
     mind_map = generate_mind_map(topic, docs, depth=data.get('depth', 3))
     return jsonify(mind_map), 200
@@ -155,14 +156,14 @@ def map_to_roadmap():
 def get_knowledge_graph():
     """Generate knowledge graph from user's documents."""
     user_id = int(get_jwt_identity())
-    user_docs = Document.query.filter_by(user_id=user_id).all()
+    user_docs = sb_select('documents', eq=('user_id', user_id))
     
     if not user_docs:
         return jsonify({'nodes': [], 'edges': [], 'stats': {
             'total_nodes': 0, 'total_edges': 0, 'documents': 0, 'concepts': 0,
         }}), 200
     
-    docs = [{'id': d.id, 'title': d.title, 'content_text': d.content_text} for d in user_docs]
+    docs = [{'id': d['id'], 'title': d['title'], 'content_text': d['content_text']} for d in user_docs]
     graph = generate_knowledge_graph(user_id, docs)
     return jsonify(graph), 200
 
@@ -175,32 +176,104 @@ def create_quiz():
     topic = data.get('topic', 'General Knowledge')
     content = ''
     
+    # Check if we should use all documents (RAG mode)
+    use_documents = data.get('use_documents', False)
     doc_id = data.get('document_id')
-    if doc_id:
-        user_id = int(get_jwt_identity())
-        doc = Document.query.filter_by(id=doc_id, user_id=user_id).first()
-        if doc and doc.content_text:
-            content = doc.content_text
-            topic = doc.title
+    user_id = int(get_jwt_identity())
     
-    questions = generate_quiz(topic, content, data.get('num_questions', 5))
+    if use_documents:
+        user_docs = sb_select('documents', eq=('user_id', user_id))
+        content = ' '.join([str(d.get('content_text', '')) for d in user_docs[:10]])[:15000] # Provide general context
+        if not content.strip():
+            content = "WARNING: No document content found. Switch to general knowledge. "
+    elif doc_id:
+        doc = sb_select('documents', match={'id': doc_id, 'user_id': user_id}, single=True)
+        if doc and doc.get('content_text'):
+            content = doc['content_text']
+            topic = doc['title']
+    
+    difficulty = data.get('difficulty', 'medium')
+    questions = generate_quiz(topic, content, data.get('num_questions', 5), difficulty)
     questions['topic'] = topic  # Keep topic parameter for frontend convenience
     return jsonify(questions), 200
 
+@intelligence_bp.route('/quiz/save-attempt', methods=['POST'])
+@jwt_required()
+def save_quiz_attempt():
+    """Save user quiz result."""
+    user_id = int(get_jwt_identity())
+    data = request.get_json()
+    
+    attempt = {
+        'user_id': user_id,
+        'topic': data.get('topic', 'General Knowledge'),
+        'score': data.get('score', 0),
+        'total_questions': data.get('total_questions', 0),
+        'time_taken_seconds': data.get('time_taken_seconds', 0),
+        'difficulty': data.get('difficulty', 'medium')
+    }
+    
+    try:
+        sb_insert('quiz_attempts', attempt)
+        return jsonify({'message': 'Attempt saved'}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@intelligence_bp.route('/quiz/history', methods=['GET'])
+@jwt_required()
+def get_quiz_history():
+    """Get user's recent quiz attempts."""
+    user_id = int(get_jwt_identity())
+    try:
+        attempts = sb_select('quiz_attempts', eq=('user_id', user_id), order=('created_at', {'ascending': False}))
+        # Return last 10
+        return jsonify({'attempts': attempts[:10] if attempts else []}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@intelligence_bp.route('/quiz/weak-topics', methods=['GET'])
+@jwt_required()
+def get_weak_topics():
+    """Get topics where user scores below 60% repeatedly."""
+    user_id = int(get_jwt_identity())
+    try:
+        attempts = sb_select('quiz_attempts', eq=('user_id', user_id))
+        if not attempts:
+            return jsonify({'weak_topics': []}), 200
+            
+        topic_stats = {}
+        for a in attempts:
+            t = a.get('topic', '')
+            if t not in topic_stats:
+                topic_stats[t] = {'total_score': 0, 'total_qs': 0, 'count': 0}
+            topic_stats[t]['total_score'] += a.get('score', 0)
+            topic_stats[t]['total_qs'] += a.get('total_questions', 0)
+            topic_stats[t]['count'] += 1
+            
+        weak = []
+        for t, stats in topic_stats.items():
+            if stats['total_qs'] > 0 and stats['count'] >= 2:
+                pct = (stats['total_score'] / stats['total_qs']) * 100
+                if pct < 60:
+                    weak.append({'topic': t, 'average': round(pct, 1), 'attempts': stats['count']})
+                    
+        return jsonify({'weak_topics': sorted(weak, key=lambda x: x['average'])}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @intelligence_bp.route('/summarize/<int:doc_id>', methods=['GET'])
 @jwt_required()
 def summarize(doc_id):
     """Summarize a document."""
     user_id = int(get_jwt_identity())
-    doc = Document.query.filter_by(id=doc_id, user_id=user_id).first()
+    doc = sb_select('documents', match={'id': doc_id, 'user_id': user_id}, single=True)
     if not doc:
         return jsonify({'error': 'Document not found'}), 404
-    if not doc.content_text:
+    if not doc.get('content_text'):
         return jsonify({'error': 'No text content to summarize'}), 422
     
-    summary = summarize_document(doc.content_text)
-    return jsonify({'document_id': doc_id, 'title': doc.title, 'summary': summary}), 200
+    summary = summarize_document(doc['content_text'])
+    return jsonify({'document_id': doc_id, 'title': doc['title'], 'summary': summary}), 200
 
 
 @intelligence_bp.route('/explain', methods=['POST'])
@@ -216,8 +289,23 @@ def explain():
     context = ''
     if data.get('use_documents'):
         user_id = int(get_jwt_identity())
-        docs = Document.query.filter_by(user_id=user_id).all()
-        context = ' '.join([d.content_text or '' for d in docs[:5]])[:3000]
+        docs = sb_select('documents', eq=('user_id', user_id))
+        context = ' '.join([d.get('content_text', '') for d in docs[:5]])[:3000]
     
     explanation = explain_concept(concept, context)
     return jsonify({'concept': concept, 'explanation': explanation}), 200
+
+@intelligence_bp.route('/tutor/followup', methods=['POST'])
+@jwt_required()
+def followup():
+    """AI Tutor responds to follow up questions."""
+    data = request.get_json()
+    topic = data.get('topic')
+    question = data.get('question')
+    context = data.get('context', [])
+    
+    if not question:
+        return jsonify({'error': 'Question is required'}), 422
+        
+    answer = generate_tutor_followup(topic, question, context)
+    return jsonify({'answer': answer}), 200

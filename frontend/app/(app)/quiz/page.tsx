@@ -2,14 +2,26 @@
 
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import api, { QuizQuestion } from '@/lib/api';
-import { HiOutlineAcademicCap, HiOutlineCheckCircle, HiOutlineXCircle, HiOutlineSparkles } from 'react-icons/hi2';
+import api, { QuizQuestion as QuizQuestionType } from '@/lib/api';
+import { HiOutlineAcademicCap, HiOutlineCheckCircle, HiOutlineXCircle, HiOutlineSparkles, HiOutlineSpeakerWave, HiOutlineStop } from 'react-icons/hi2';
+import MarkdownRenderer from '@/components/MarkdownRenderer';
+import { useSpeech } from '@/hooks/useSpeech';
+import QuizSettings, { Difficulty, QuestionCount, KnowledgeSource } from '@/components/QuizSettings';
+import QuizQuestion from '@/components/QuizQuestion';
+import PostQuizReview from '@/components/PostQuizReview';
+import QuizAnalytics from '@/components/QuizAnalytics';
 
 export default function QuizPage() {
   const [topic, setTopic] = useState('');
-  const [questions, setQuestions] = useState<QuizQuestion[]>([]);
+  const [questions, setQuestions] = useState<QuizQuestionType[]>([]);
   const [current, setCurrent] = useState(0);
   const [selected, setSelected] = useState<number | null>(null);
+  const [userAnswers, setUserAnswers] = useState<(number | null)[]>([]);
+  
+  // Quiz Settings State
+  const [difficulty, setDifficulty] = useState<Difficulty>('medium');
+  const [questionCount, setQuestionCount] = useState<QuestionCount>(5);
+  const [source, setSource] = useState<KnowledgeSource>('general');
   const [score, setScore] = useState(0);
   const [showResult, setShowResult] = useState(false);
   const [quizComplete, setQuizComplete] = useState(false);
@@ -17,14 +29,16 @@ export default function QuizPage() {
   const [concept, setConcept] = useState('');
   const [explanation, setExplanation] = useState('');
   const [explaining, setExplaining] = useState(false);
+  const { isSpeaking, speak, stop, supported } = useSpeech();
 
   const startQuiz = async () => {
     if (!topic.trim()) return;
     setLoading(true);
     try {
-      const res = await api.generateQuiz(topic);
+      const res = await api.generateQuiz(topic, undefined, difficulty, questionCount, source === 'documents');
       setQuestions(res.quiz);
       setExplanation(res.explanation);
+      setUserAnswers(new Array(res.quiz.length).fill(null));
       setCurrent(0); setSelected(null); setScore(0);
       setShowResult(false); setQuizComplete(false);
     } catch (err) { console.error(err); }
@@ -35,14 +49,29 @@ export default function QuizPage() {
     if (showResult) return;
     setSelected(idx);
     setShowResult(true);
-    if (questions[current].options[idx] === questions[current].correct) setScore(s => s + 1);
+    
+    setUserAnswers(prev => {
+      const updated = [...prev];
+      updated[current] = idx;
+      return updated;
+    });
+
+    if (idx !== -1 && questions[current].options[idx] === questions[current].correct) {
+      setScore(s => s + 1);
+    }
   };
 
-  const nextQuestion = () => {
+  const nextQuestion = async () => {
     if (current < questions.length - 1) {
       setCurrent(c => c + 1); setSelected(null); setShowResult(false);
     } else {
       setQuizComplete(true);
+      try {
+        const finalScore = selected !== -1 && questions[current].options[selected as number] === questions[current].correct ? score + 1 : score;
+        await api.saveQuizAttempt(topic, finalScore, questions.length, 0, difficulty);
+      } catch (e) {
+        console.error("Failed to save quiz attempt:", e);
+      }
     }
   };
 
@@ -83,67 +112,24 @@ export default function QuizPage() {
               </button>
             </div>
           </div>
+          
+          <QuizSettings
+            difficulty={difficulty} setDifficulty={setDifficulty}
+            questionCount={questionCount} setQuestionCount={setQuestionCount}
+            source={source} setSource={setSource}
+          />
 
           {questions.length > 0 && !quizComplete && q && (
-            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
-              className="glass-card" style={{ padding: 24 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-                <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                  Question {current + 1} of {questions.length}
-                </span>
-                <span style={{ fontSize: '0.85rem', color: 'var(--accent-blue)', fontWeight: 600 }}>
-                  Score: {score}/{questions.length}
-                </span>
-              </div>
-
-              <div className="progress-bar" style={{ marginBottom: 20 }}>
-                <div className="progress-bar-fill" style={{ width: `${((current + 1) / questions.length) * 100}%` }} />
-              </div>
-
-              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, marginBottom: 20, lineHeight: 1.5 }}>
-                {q.question}
-              </h3>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {q.options.map((opt, i) => {
-                  let bg = 'rgba(255,255,255,0.02)';
-                  let border = 'var(--border-default)';
-                  let icon = null;
-                  if (showResult) {
-                    if (q.options[i] === q.correct) { bg = 'rgba(16,185,129,0.1)'; border = 'rgba(16,185,129,0.3)'; icon = <HiOutlineCheckCircle style={{ color: '#10b981' }} />; }
-                    else if (i === selected && q.options[i] !== q.correct) { bg = 'rgba(239,68,68,0.1)'; border = 'rgba(239,68,68,0.3)'; icon = <HiOutlineXCircle style={{ color: '#ef4444' }} />; }
-                  }
-                  return (
-                    <button key={i} onClick={() => selectAnswer(i)} style={{
-                      padding: '12px 16px', borderRadius: 10, textAlign: 'left',
-                      background: bg, border: `1px solid ${border}`, cursor: showResult ? 'default' : 'pointer',
-                      color: 'inherit', fontFamily: 'inherit', fontSize: '0.9rem',
-                      display: 'flex', alignItems: 'center', gap: 10, transition: 'all 0.2s',
-                    }}>
-                      <span style={{
-                        width: 24, height: 24, borderRadius: 6, flexShrink: 0,
-                        background: 'rgba(255,255,255,0.05)', display: 'flex',
-                        alignItems: 'center', justifyContent: 'center', fontSize: '0.8rem',
-                        fontWeight: 600, color: 'var(--text-muted)',
-                      }}>
-                        {String.fromCharCode(65 + i)}
-                      </span>
-                      {opt}
-                      {icon && <span style={{ marginLeft: 'auto' }}>{icon}</span>}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {showResult && (
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ marginTop: 16 }}>
-                  <button onClick={nextQuestion} className="btn-gradient"
-                    style={{ marginTop: 16, padding: '10px 24px' }}>
-                    {current < questions.length - 1 ? 'Next Question →' : 'See Results'}
-                  </button>
-                </motion.div>
-              )}
-            </motion.div>
+            <QuizQuestion 
+              question={q}
+              currentNum={current + 1}
+              totalNum={questions.length}
+              selected={selected}
+              showResult={showResult}
+              score={score}
+              onSelect={selectAnswer}
+              onNext={nextQuestion}
+            />
           )}
 
           {quizComplete && (
@@ -175,7 +161,7 @@ export default function QuizPage() {
                   fontSize: '0.95rem', color: 'var(--text-secondary)', lineHeight: 1.6,
                 }}>
                   <h4 style={{ color: 'var(--text-primary)', marginBottom: 8, fontSize: '1.05rem' }}>Concept Overview</h4>
-                  💡 {explanation}
+                  <MarkdownRenderer content={explanation} />
                 </div>
               )}
 
@@ -185,11 +171,46 @@ export default function QuizPage() {
               </button>
             </motion.div>
           )}
+
+          {quizComplete && (
+            <PostQuizReview 
+              questions={questions}
+              userAnswers={userAnswers}
+              topic={topic}
+              onRetake={startQuiz}
+              onNewTopic={() => { setQuestions([]); setTopic(''); setQuizComplete(false); }}
+            />
+          )}
         </div>
+
 
         {/* Explain Section */}
         <div>
-          <h2 style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 16 }}>🧠 Concept Explainer</h2>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+            <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>🧠 Concept Explainer</h2>
+            {explanation && supported && (
+              <button 
+                onClick={() => isSpeaking ? stop() : speak(explanation)}
+                className="btn-gradient"
+                style={{
+                  padding: '6px 12px',
+                  fontSize: '0.8rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  background: isSpeaking ? 'rgba(239, 68, 68, 0.2)' : undefined,
+                  border: isSpeaking ? '1px solid rgba(239, 68, 68, 0.4)' : undefined,
+                  color: isSpeaking ? '#f87171' : undefined
+                }}
+              >
+                {isSpeaking ? (
+                  <><HiOutlineStop size={16} /> Stop</>
+                ) : (
+                  <><HiOutlineSpeakerWave size={16} className={isSpeaking ? 'pulse-anim' : ''} /> Listen</>
+                )}
+              </button>
+            )}
+          </div>
           <div className="glass-card" style={{ padding: 24 }}>
             <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
               <input value={concept} onChange={e => setConcept(e.target.value)}
@@ -205,10 +226,8 @@ export default function QuizPage() {
                 style={{
                   padding: '16px', borderRadius: 12,
                   background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border-subtle)',
-                  fontSize: '0.9rem', color: 'var(--text-secondary)', lineHeight: 1.8,
-                  whiteSpace: 'pre-wrap',
                 }}>
-                {explanation}
+                <MarkdownRenderer content={explanation} />
               </motion.div>
             )}
             {!explanation && !explaining && (
@@ -218,6 +237,10 @@ export default function QuizPage() {
                 <p style={{ fontSize: '0.8rem', marginTop: 4 }}>Uses your documents for context</p>
               </div>
             )}
+          </div>
+          
+          <div style={{ marginTop: 24 }}>
+            <QuizAnalytics />
           </div>
         </div>
       </div>

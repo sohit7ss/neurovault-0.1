@@ -31,3 +31,8 @@ marshmallow==3.26.1
 # numpy fails to install on latest python without GCC 8
 # numpy==2.2.4
 # rank_bm25==0.2.2
+google-generativeai==0.8.3
+supabase==2.11.0
+neo4j==5.27.0
+requests==2.32.3
+huggingface-hub==0.27.0

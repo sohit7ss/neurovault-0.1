@@ -57,6 +57,16 @@ class Config:
     # Frontend
     FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000')
 
+    # API Keys
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+    HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY', '')
+    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
+    NEO4J_URI = os.getenv('NEO4J_URI', 'neo4j+s://860967f9.databases.neo4j.io')
+    NEO4J_USERNAME = os.getenv('NEO4J_USERNAME', '')
+    NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', '')
+    SUPABASE_URL = os.getenv('SUPABASE_URL', '')
+    SUPABASE_KEY = os.getenv('SUPABASE_KEY', '')
+
 
 class DevelopmentConfig(Config):
     DEBUG = True

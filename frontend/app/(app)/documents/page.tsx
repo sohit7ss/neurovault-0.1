@@ -2,14 +2,15 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import api, { Document } from '@/lib/api';
+import api, { Document, Workspace } from '@/lib/api';
 import {
   HiOutlineDocumentText, HiOutlineArrowUpTray, HiOutlineTrash,
-  HiOutlineXMark, HiOutlineCloudArrowUp,
+  HiOutlineXMark, HiOutlineCloudArrowUp, HiOutlineShare
 } from 'react-icons/hi2';
 
 export default function DocumentsPage() {
   const [documents, setDocuments] = useState<Document[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
@@ -18,21 +19,31 @@ export default function DocumentsPage() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
 
-  const fetchDocuments = useCallback(async () => {
+  // Share Modal State
+  const [shareDocId, setShareDocId] = useState<number | null>(null);
+  const [shareWsId, setShareWsId] = useState<number>(0);
+  const [shareSharing, setShareSharing] = useState(false);
+
+  const fetchData = useCallback(async () => {
     try {
-      const res = await api.getDocuments(page, 12);
-      setDocuments(res.documents);
-      setTotal(res.total);
+      const [docRes, wsRes] = await Promise.all([
+        api.getDocuments(page, 12),
+        api.getWorkspaces()
+      ]);
+      setDocuments(docRes.documents);
+      setTotal(docRes.total);
+      setWorkspaces(wsRes.workspaces);
+      if (wsRes.workspaces.length > 0) setShareWsId(wsRes.workspaces[0].id);
     } catch (err) {
-      console.error('Failed to fetch documents:', err);
+      console.error('Failed to fetch data:', err);
     } finally {
       setLoading(false);
     }
   }, [page]);
 
   useEffect(() => {
-    fetchDocuments();
-  }, [fetchDocuments]);
+    fetchData();
+  }, [fetchData]);
 
   const handleUpload = async (files: FileList | File[]) => {
     setError('');
@@ -46,14 +57,14 @@ export default function DocumentsPage() {
       
       try {
         await api.uploadDocument(file);
-      } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : `Failed to upload ${file.name}`);
+      } catch (err: any) {
+        setError(err.message || `Failed to upload ${file.name}`);
       }
     }
 
     setUploading(false);
     setUploadProgress('');
-    fetchDocuments();
+    fetchData();
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -68,9 +79,23 @@ export default function DocumentsPage() {
     if (!confirm('Delete this document? This will also remove its embeddings.')) return;
     try {
       await api.deleteDocument(id);
-      fetchDocuments();
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete');
+      fetchData();
+    } catch (err: any) {
+      setError(err.message || 'Failed to delete');
+    }
+  };
+
+  const handleShare = async () => {
+    if (!shareDocId || !shareWsId) return;
+    setShareSharing(true);
+    try {
+      await api.shareToWorkspace(shareWsId, shareDocId);
+      alert('Document successfully shared to workspace!');
+      setShareDocId(null);
+    } catch (err: any) {
+      alert(err.message || 'Failed to share document');
+    } finally {
+      setShareSharing(false);
     }
   };
 
@@ -232,14 +257,19 @@ export default function DocumentsPage() {
                   <span>{new Date(doc.created_at).toLocaleDateString()}</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{
-                    fontSize: '0.72rem', padding: '2px 8px', borderRadius: 6,
-                    background: doc.status === 'ready' ? 'rgba(16,185,129,0.1)' : 'rgba(245,158,11,0.1)',
-                    color: doc.status === 'ready' ? '#10b981' : '#f59e0b',
-                    fontWeight: 500,
-                  }}>
-                    {doc.status}
-                  </span>
+                  <button
+                    onClick={() => setShareDocId(doc.id)}
+                    style={{
+                      background: 'none', border: 'none', cursor: 'pointer',
+                      padding: 4, borderRadius: 6, color: '#3b82f6',
+                      transition: 'opacity 0.2s', opacity: 0.8
+                    }}
+                    title="Share to Workspace"
+                    onMouseOver={e => e.currentTarget.style.opacity = '1'}
+                    onMouseOut={e => e.currentTarget.style.opacity = '0.8'}
+                  >
+                    <HiOutlineShare size={18} />
+                  </button>
                   <button
                     onClick={() => handleDelete(doc.id)}
                     style={{
@@ -257,6 +287,63 @@ export default function DocumentsPage() {
           ))}
         </motion.div>
       )}
+
+      {/* Share Modal */}
+      <AnimatePresence>
+        {shareDocId && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            style={{
+              position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+              background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100
+            }}
+            onClick={() => setShareDocId(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="glass-card"
+              style={{ padding: 32, width: '100%', maxWidth: 400 }}
+              onClick={e => e.stopPropagation()}
+            >
+              <h2 style={{ fontSize: '1.2rem', fontWeight: 600, marginBottom: 8 }}>Share to Workspace</h2>
+              <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: 24 }}>
+                Select a workspace to share this document with.
+              </p>
+              
+              {workspaces.length === 0 ? (
+                <p style={{ color: '#ef4444', fontSize: '0.9rem' }}>You are not a member of any workspaces.</p>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <select 
+                    value={shareWsId} 
+                    onChange={e => setShareWsId(Number(e.target.value))}
+                    className="glass-input"
+                    style={{ width: '100%', padding: '10px' }}
+                  >
+                    {workspaces.map(ws => (
+                      <option key={ws.id} value={ws.id}>{ws.name}</option>
+                    ))}
+                  </select>
+                  
+                  <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
+                    <button style={{ flex: 1, padding: '10px' }} className="btn-secondary" onClick={() => setShareDocId(null)}>
+                      Cancel
+                    </button>
+                    <button style={{ flex: 1, padding: '10px' }} className="btn-gradient" onClick={handleShare} disabled={shareSharing}>
+                      {shareSharing ? 'Sharing...' : 'Share Document'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Pagination */}
       {total > 12 && (

@@ -36,3 +36,5 @@ supabase==2.11.0
 neo4j==5.27.0
 requests==2.32.3
 huggingface-hub==0.27.0
+
+eventlet>=0.33.0

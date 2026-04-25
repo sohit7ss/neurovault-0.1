@@ -10,6 +10,7 @@ import {
   HiOutlineVideoCamera, HiOutlineBookOpen, HiOutlineAcademicCap,
   HiOutlineCodeBracket, HiOutlineLink
 } from 'react-icons/hi2';
+import { logActivity } from '@/lib/streakTracker';
 
 const phaseColors = ['#3b82f6', '#8b5cf6', '#10b981', '#f59e0b', '#ec4899', '#06b6d4'];
 
@@ -56,7 +57,7 @@ export default function RoadmapPage() {
     }
   };
 
-  useEffect(() => { fetchRoadmaps(); }, []);
+  useEffect(() => { logActivity('roadmap_visit'); fetchRoadmaps(); }, []);
 
   const handleGenerate = async () => {
     if (!goal.trim()) return;

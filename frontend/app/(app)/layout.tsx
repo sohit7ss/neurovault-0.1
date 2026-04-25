@@ -5,21 +5,32 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import { AuthProvider, useAuth } from '@/lib/auth';
+import { isOnboardingComplete } from '@/lib/userProfile';
+import { getStreak } from '@/lib/streakTracker';
+import OnboardingWizard from '@/components/OnboardingWizard';
+import QuickAskPopup from '@/components/QuickAskPopup';
 import {
   HiOutlineSquares2X2, HiOutlineDocumentText, HiOutlineChatBubbleLeftRight,
   HiOutlineMap, HiOutlineArrowRightOnRectangle, HiOutlineBars3, HiOutlineXMark,
   HiOutlineUser, HiOutlineLightBulb, HiOutlineShare, HiOutlineAcademicCap,
-  HiOutlineTrophy,
+  HiOutlineTrophy, HiOutlineUserGroup, HiOutlineChartBar, HiOutlineBriefcase,
+  HiOutlineCodeBracketSquare, HiOutlineCalendarDays,
 } from 'react-icons/hi2';
 
 const navItems = [
   { href: '/dashboard', label: 'Dashboard', icon: HiOutlineSquares2X2 },
   { href: '/documents', label: 'Documents', icon: HiOutlineDocumentText },
+  { href: '/flashcards', label: 'Flashcards', icon: HiOutlineSquares2X2 },
   { href: '/chat', label: 'AI Search', icon: HiOutlineChatBubbleLeftRight },
   { href: '/roadmap', label: 'Roadmaps', icon: HiOutlineMap },
+  { href: '/career', label: 'Career Simulator', icon: HiOutlineBriefcase },
   { href: '/mindmap', label: 'Mind Maps', icon: HiOutlineLightBulb },
   { href: '/knowledge', label: 'Knowledge Graph', icon: HiOutlineShare },
   { href: '/quiz', label: 'AI Tutor', icon: HiOutlineAcademicCap },
+  { href: '/planner', label: 'Study Planner', icon: HiOutlineCalendarDays },
+  { href: '/dsa', label: 'DSA Tracker', icon: HiOutlineCodeBracketSquare },
+  { href: '/analytics', label: 'Analytics', icon: HiOutlineChartBar },
+  { href: '/community', label: 'Community', icon: HiOutlineUserGroup },
   { href: '/workspaces', label: 'Workspaces', icon: HiOutlineUser },
   { href: '/achievements', label: 'Achievements', icon: HiOutlineTrophy },
 ];
@@ -29,12 +40,25 @@ function DashboardContent({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showWizard, setShowWizard] = useState(false);
+  const [streak, setStreak] = useState(0);
 
   useEffect(() => {
     if (!loading && !isAuthenticated) {
       router.push('/login');
     }
   }, [loading, isAuthenticated, router]);
+
+  useEffect(() => {
+    if (isAuthenticated && !loading) {
+      // Check onboarding
+      if (!isOnboardingComplete()) {
+        setShowWizard(true);
+      }
+      // Get streak
+      setStreak(getStreak());
+    }
+  }, [isAuthenticated, loading]);
 
   if (loading) {
     return (
@@ -59,6 +83,14 @@ function DashboardContent({ children }: { children: ReactNode }) {
   return (
     <div style={{ display: 'flex', minHeight: '100vh' }}>
       <div className="mesh-gradient" />
+
+      {/* Onboarding Wizard */}
+      {showWizard && (
+        <OnboardingWizard onComplete={() => {
+          setShowWizard(false);
+          setStreak(getStreak());
+        }} />
+      )}
       
       {/* Mobile overlay */}
       <AnimatePresence>
@@ -78,7 +110,7 @@ function DashboardContent({ children }: { children: ReactNode }) {
 
       {/* Sidebar */}
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
-        {/* Logo */}
+        {/* Logo + Streak */}
         <div style={{
           display: 'flex', alignItems: 'center', gap: 12,
           padding: '0 8px', marginBottom: 40,
@@ -91,9 +123,21 @@ function DashboardContent({ children }: { children: ReactNode }) {
           }}>
             N
           </div>
-          <span style={{ fontSize: '1.1rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
+          <span style={{ fontSize: '1.1rem', fontWeight: 700, letterSpacing: '-0.02em', flex: 1 }}>
             NeuroVault
           </span>
+          {streak > 0 && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 4,
+              padding: '4px 10px', borderRadius: 20,
+              background: 'rgba(245,158,11,0.1)',
+              border: '1px solid rgba(245,158,11,0.2)',
+              fontSize: '0.8rem', fontWeight: 700, color: '#f59e0b',
+              flexShrink: 0,
+            }}>
+              🔥 {streak}
+            </div>
+          )}
         </div>
 
         {/* Nav Items */}
@@ -178,6 +222,9 @@ function DashboardContent({ children }: { children: ReactNode }) {
             {sidebarOpen ? <HiOutlineXMark size={20} /> : <HiOutlineBars3 size={20} />}
           </button>
           <span style={{ fontWeight: 600 }}>NeuroVault</span>
+          {streak > 0 && (
+            <span style={{ fontSize: '0.8rem', fontWeight: 700, color: '#f59e0b' }}>🔥 {streak}</span>
+          )}
         </div>
 
         <motion.div
@@ -202,6 +249,7 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
   return (
     <AuthProvider>
       <DashboardContent>{children}</DashboardContent>
+      <QuickAskPopup />
     </AuthProvider>
   );
 }

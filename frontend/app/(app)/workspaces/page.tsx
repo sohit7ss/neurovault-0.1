@@ -537,7 +537,7 @@ export default function WorkspacesPage() {
                                 <span style={{ fontSize: '0.9rem', color: '#fff', marginRight: 12 }}>{inv.email}</span>
                                 <span style={{ fontSize: '0.75rem', padding: '2px 6px', background: 'rgba(255,255,255,0.1)', borderRadius: 4, textTransform: 'uppercase' }}>{inv.role}</span>
                               </div>
-                              <button onClick={() => api.request(`/workspaces/${selectedWs.id}/invites/${inv.id}`, { method: 'DELETE' }).then(() => loadWorkspaceDetails(selectedWs.id))}
+                              <button onClick={() => fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api'}/workspaces/${selectedWs.id}/invites/${inv.id}`, { method: 'DELETE', credentials: 'include' }).then(() => loadWorkspaceDetails(selectedWs.id))}
                                 style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: '0.8rem' }}>
                                 Cancel Invite
                               </button>

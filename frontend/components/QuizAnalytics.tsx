@@ -65,7 +65,7 @@ export default function QuizAnalytics() {
                 contentStyle={{ background: 'rgba(15,23,42,0.9)', border: '1px solid var(--border-subtle)', borderRadius: 8, backdropFilter: 'blur(10px)' }}
                 itemStyle={{ color: '#fff' }}
                 labelStyle={{ color: 'var(--text-muted)', marginBottom: 4 }}
-                formatter={(value: number) => [`${value}%`, 'Score']}
+                formatter={(value: any) => [`${value}%`, 'Score']}
               />
               <Line type="monotone" dataKey="score" stroke="var(--accent-blue)" strokeWidth={3} dot={{ fill: 'var(--accent-blue)', r: 4 }} activeDot={{ r: 6 }} />
             </LineChart>

@@ -3,9 +3,13 @@
 import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import api, { Document, Workspace } from '@/lib/api';
+import { createCard } from '@/lib/flashcardStore';
+import { logActivity } from '@/lib/streakTracker';
+import MarkdownRenderer from '@/components/MarkdownRenderer';
 import {
   HiOutlineDocumentText, HiOutlineArrowUpTray, HiOutlineTrash,
-  HiOutlineXMark, HiOutlineCloudArrowUp, HiOutlineShare
+  HiOutlineXMark, HiOutlineCloudArrowUp, HiOutlineShare, HiOutlineSparkles,
+  HiOutlineNewspaper,
 } from 'react-icons/hi2';
 
 export default function DocumentsPage() {
@@ -23,6 +27,16 @@ export default function DocumentsPage() {
   const [shareDocId, setShareDocId] = useState<number | null>(null);
   const [shareWsId, setShareWsId] = useState<number>(0);
   const [shareSharing, setShareSharing] = useState(false);
+
+  // Flashcard generation
+  const [generatingFlashcards, setGeneratingFlashcards] = useState<number | null>(null);
+
+  // Summary
+  const [summarizingId, setSummarizingId] = useState<number | null>(null);
+  const [summaryContent, setSummaryContent] = useState('');
+  const [summaryTitle, setSummaryTitle] = useState('');
+  const [showSummary, setShowSummary] = useState(false);
+  const [flashcardSuccess, setFlashcardSuccess] = useState<number | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -42,8 +56,34 @@ export default function DocumentsPage() {
   }, [page]);
 
   useEffect(() => {
+    logActivity('documents_visit');
     fetchData();
   }, [fetchData]);
+
+  const handleGenerateFlashcards = async (doc: Document) => {
+    setGeneratingFlashcards(doc.id);
+    try {
+      const prompt = `Extract 10 flashcard pairs from this document titled "${doc.title}". Return ONLY a valid JSON array: [{"front": "question or term", "back": "answer or definition"}]. Content context: ${doc.title}, filename: ${doc.filename}.`;
+      const res = await api.queryAI(prompt);
+      let parsed: { front: string; back: string }[] = [];
+      try {
+        const match = res.answer.match(/\[[\s\S]*\]/);
+        if (match) parsed = JSON.parse(match[0]);
+      } catch { /* ignore parse errors */ }
+      if (parsed.length > 0) {
+        parsed.forEach(p => {
+          createCard({ front: p.front, back: p.back, deckName: doc.title, source: doc.title });
+        });
+        logActivity('flashcard_generate');
+        setFlashcardSuccess(doc.id);
+        setTimeout(() => setFlashcardSuccess(null), 3000);
+      }
+    } catch (err) {
+      console.error('Flashcard generation failed:', err);
+    } finally {
+      setGeneratingFlashcards(null);
+    }
+  };
 
   const handleUpload = async (files: FileList | File[]) => {
     setError('');
@@ -258,6 +298,47 @@ export default function DocumentsPage() {
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <button
+                    onClick={() => handleGenerateFlashcards(doc)}
+                    disabled={generatingFlashcards === doc.id}
+                    style={{
+                      background: flashcardSuccess === doc.id ? 'rgba(16,185,129,0.1)' : 'rgba(139,92,246,0.08)',
+                      border: `1px solid ${flashcardSuccess === doc.id ? 'rgba(16,185,129,0.2)' : 'rgba(139,92,246,0.15)'}`,
+                      borderRadius: 6, padding: '4px 8px', cursor: generatingFlashcards === doc.id ? 'wait' : 'pointer',
+                      color: flashcardSuccess === doc.id ? '#10b981' : '#8b5cf6',
+                      fontFamily: 'inherit', fontSize: '0.72rem', fontWeight: 600,
+                      display: 'flex', alignItems: 'center', gap: 4,
+                      transition: 'all 0.2s',
+                    }}
+                    title="Generate Flashcards"
+                  >
+                    <HiOutlineSparkles size={13} />
+                    {generatingFlashcards === doc.id ? 'Generating...' : flashcardSuccess === doc.id ? '✓ Done' : 'Flashcards'}
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setSummarizingId(doc.id);
+                      try {
+                        const res = await api.queryAI(`Provide a concise yet thorough summary of the document titled "${doc.title}". Include key points, main ideas, and important details. Use bullet points and headers.`);
+                        setSummaryContent(res.answer || 'Could not generate summary.');
+                        setSummaryTitle(doc.title);
+                        setShowSummary(true);
+                      } catch { setSummaryContent('Failed to summarize.'); setShowSummary(true); setSummaryTitle(doc.title); }
+                      finally { setSummarizingId(null); }
+                    }}
+                    disabled={summarizingId === doc.id}
+                    style={{
+                      background: 'rgba(59,130,246,0.08)',
+                      border: '1px solid rgba(59,130,246,0.15)',
+                      borderRadius: 6, padding: '4px 8px', cursor: summarizingId === doc.id ? 'wait' : 'pointer',
+                      color: '#3b82f6', fontFamily: 'inherit', fontSize: '0.72rem', fontWeight: 600,
+                      display: 'flex', alignItems: 'center', gap: 4, transition: 'all 0.2s',
+                    }}
+                    title="Summarize Document"
+                  >
+                    <HiOutlineNewspaper size={13} />
+                    {summarizingId === doc.id ? '...' : 'Summary'}
+                  </button>
+                  <button
                     onClick={() => setShareDocId(doc.id)}
                     style={{
                       background: 'none', border: 'none', cursor: 'pointer',
@@ -374,6 +455,42 @@ export default function DocumentsPage() {
           </button>
         </div>
       )}
+      {/* Summary Modal */}
+      <AnimatePresence>
+        {showSummary && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            style={{
+              position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+              background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100
+            }}
+            onClick={() => setShowSummary(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+              className="glass-card"
+              style={{ padding: 32, width: '100%', maxWidth: 640, maxHeight: '80vh', overflow: 'auto' }}
+              onClick={e => e.stopPropagation()}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                <h2 style={{ fontSize: '1.1rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <HiOutlineNewspaper size={20} style={{ color: '#3b82f6' }} /> AI Summary
+                </h2>
+                <button onClick={() => setShowSummary(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 4 }}>
+                  <HiOutlineXMark size={20} />
+                </button>
+              </div>
+              <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: 16 }}>
+                {summaryTitle}
+              </div>
+              <div style={{ lineHeight: 1.7 }}>
+                <MarkdownRenderer content={summaryContent} />
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
